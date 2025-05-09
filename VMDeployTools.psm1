@@ -54,7 +54,7 @@ function Save-SudoPasswordTo1Password {
     }
 
     try {
-        op item create login `
+        op item create `
             --vault $Vault `
             --title $VMName `
             --category login `
