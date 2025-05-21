@@ -8,7 +8,7 @@ function Write-LogEntry {
         [Parameter(Mandatory)][string]$VMName,
         [Parameter(Mandatory)][string]$Message
     )
-    $logDir = "C:\modules\VMDeployTools\logs"
+    $logDir = ".\logs"
     if (-not (Test-Path $logDir)) {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     }
@@ -42,6 +42,7 @@ function Save-SudoPasswordTo1Password {
         [Parameter(Mandatory=$true)][SecureString]$SecurePassword,
         [string]$Vault = 'homelab-vault'
     )
+
     # Ensure 1Password session
     Set-OpSession
 
@@ -88,7 +89,12 @@ function Connect-ToVCenter {
 }
 
 function New-RandomPassword {
-    return ([System.Web.Security.Membership]::GeneratePassword(20, 3))
+    param (
+        [int]$Length = 20
+    )
+
+    $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_-+=<>?'
+    -join (1..$Length | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
 }
 
 function ConvertTo-SHA512Crypt {
@@ -246,6 +252,7 @@ function Install-VirtualMachine {
     )
     if ($WhatIf) {
         Write-Host "[WhatIf] Would deploy VM $VMName"
+        Write-Host "[WhatIf] Would save sudo password to 1Password"
         return
     }
     Write-LogEntry -VMName $VMName -Message "Install-VirtualMachine START"
