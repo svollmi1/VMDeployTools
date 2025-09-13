@@ -18,11 +18,14 @@
     FunctionsToExport = @(
         'Set-OpSession',
         'Connect-ToVCenter',
+        'Test-VMHostReadiness',
         'Invoke-VMDeployment',
         'Add-DnsRecordToPiHole',
+        'Remove-DnsRecordFromPiHole',
         'New-SshKeyPair',
         'Add-SshConfigEntry',
-        'Install-VirtualMachine'
+        'Install-VirtualMachine',
+        'Remove-VMDeployment'
     )
 
     CmdletsToExport   = @()

@@ -55,14 +55,23 @@ function Save-SudoPasswordTo1Password {
     }
 
     try {
-        op item create `
-            --vault $Vault `
-            --title $VMName `
-            --category login `
-            username=vollmin `
-            password=$PlainPassword `
-            --tags Homelab
-        Write-LogEntry -VMName $VMName -Message "Sudo password saved to 1Password item '$VMName'"
+        # Check if item already exists
+        $existingItem = op item get $VMName --vault $Vault --format json 2>$null
+        if ($existingItem) {
+            # Item exists, update the password
+            op item edit $VMName --vault $Vault password=$PlainPassword
+            Write-LogEntry -VMName $VMName -Message "Sudo password updated in existing 1Password item '$VMName'"
+        } else {
+            # Item doesn't exist, create new one
+            op item create `
+                --vault $Vault `
+                --title $VMName `
+                --category login `
+                username=vollmin `
+                password=$PlainPassword `
+                --tags Homelab
+            Write-LogEntry -VMName $VMName -Message "Sudo password saved to new 1Password item '$VMName'"
+        }
     } catch {
         Write-LogEntry -VMName $VMName -Message ("ERROR saving sudo password to 1Password: {0}" -f $_)
         throw
@@ -85,6 +94,64 @@ function Connect-ToVCenter {
         if (-not $conn.IsConnected) {
             throw "Failed to connect to vCenter."
         }
+    }
+}
+
+function Test-VMHostReadiness {
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$VMName
+    )
+    
+    try {
+        $cluster = Get-Cluster -Name $ClusterName -ErrorAction Stop
+        $allHosts = Get-VMHost -Location $cluster
+        $hosts = $allHosts | Where-Object { $_.ConnectionState -eq "Connected" -and $_.State -ne "Maintenance" }
+        
+        # Log information about excluded hosts
+        $excludedHosts = $allHosts | Where-Object { $_.ConnectionState -ne "Connected" -or $_.State -eq "Maintenance" }
+        foreach ($excludedHost in $excludedHosts) {
+            Write-LogEntry -VMName $VMName -Message ("Excluded host '{0}': State={1}, ConnectionState={2}" -f $excludedHost.Name, $excludedHost.State, $excludedHost.ConnectionState)
+        }
+        
+        if ($hosts.Count -eq 0) {
+            throw "No suitable hosts found in cluster '$ClusterName'. All hosts may be in maintenance mode or disconnected."
+        }
+        
+        # Check for available resources and host state
+        foreach ($vmHost in $hosts) {
+            # Get CPU info - NumCpu is number of cores, CpuTotalMhz is total MHz available
+            $numCpu = $vmHost.NumCpu
+            $cpuTotalMhz = $vmHost.CpuTotalMhz
+            $cpuUsageMhz = $vmHost.CpuUsageMhz
+            $cpuAvailableMhz = $cpuTotalMhz - $cpuUsageMhz
+            $memoryAvailable = ($vmHost.MemoryTotalGB - $vmHost.MemoryUsageGB)
+            
+            Write-LogEntry -VMName $VMName -Message ("Host '{0}' status: {1} cores, CPU {2}/{3}MHz available ({4}%), Memory {5}GB available, State={6}, ConnectionState={7}" -f $vmHost.Name, $numCpu, $cpuAvailableMhz, $cpuTotalMhz, [math]::Round(($cpuAvailableMhz/$cpuTotalMhz)*100, 1), [math]::Round($memoryAvailable, 2), $vmHost.State, $vmHost.ConnectionState)
+            
+            # Check for resource constraints
+            if ($cpuAvailableMhz -lt 1000) {
+                Write-LogEntry -VMName $VMName -Message ("WARNING: Host '{0}' has less than 1GHz CPU available ({1}MHz)" -f $vmHost.Name, $cpuAvailableMhz)
+            }
+            if ($memoryAvailable -lt 1) {
+                Write-LogEntry -VMName $VMName -Message ("WARNING: Host '{0}' has less than 1GB memory available" -f $vmHost.Name)
+            }
+            
+            # Check for problematic host states
+            if ($vmHost.State -eq "Maintenance") {
+                Write-LogEntry -VMName $VMName -Message ("ERROR: Host '{0}' is in maintenance mode" -f $vmHost.Name)
+            }
+            if ($vmHost.ConnectionState -ne "Connected") {
+                Write-LogEntry -VMName $VMName -Message ("ERROR: Host '{0}' connection state is {1}" -f $vmHost.Name, $vmHost.ConnectionState)
+            }
+        }
+        
+        Write-LogEntry -VMName $VMName -Message ("Found {0} suitable hosts in cluster '{1}'" -f $hosts.Count, $ClusterName)
+        return $true
+        
+    } catch {
+        Write-LogEntry -VMName $VMName -Message ("Host readiness check FAILED: {0}" -f $_)
+        throw
     }
 }
 
@@ -247,22 +314,35 @@ function Install-VirtualMachine {
         [Parameter(Mandatory)][string]$IPAddress,
         [Parameter(Mandatory)][string]$PublicKeyPath,
         [ref]$GuestPassword,
+        [int]$CPU,
+        [int]$MemoryGB,
+        [int]$DiskGB,
         [switch]$WhatIf,
         [switch]$PowerOn
     )
     if ($WhatIf) {
         Write-Host "[WhatIf] Would deploy VM $VMName"
+        if ($CPU -or $MemoryGB -or $DiskGB) {
+            Write-Host "[WhatIf] Would modify resources: CPU=$CPU, Memory=${MemoryGB}GB, Disk=${DiskGB}GB"
+        }
         Write-Host "[WhatIf] Would save sudo password to 1Password"
         return
     }
     Write-LogEntry -VMName $VMName -Message "Install-VirtualMachine START"
 
-    # 1) sudo password
+    # 1) Check if VM already exists first (before generating password)
+    $existingVm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
+    if ($existingVm) {
+        Write-LogEntry -VMName $VMName -Message ("ERROR: VM '{0}' already exists with state: {1}" -f $VMName, $existingVm.PowerState)
+        throw "VM '$VMName' already exists. Please remove it manually before deploying a new one."
+    }
+
+    # 2) Generate sudo password (only after confirming VM doesn't exist)
     $guestPw = New-RandomPassword
     $GuestPassword.Value = $guestPw
     Save-SudoPasswordTo1Password -VMName $VMName -SecurePassword (ConvertTo-SecureString $guestPw -AsPlainText -Force)
 
-    # 2) cloud-init
+    # 3) cloud-init
     $hashedPw = ConvertTo-SHA512Crypt -Password (ConvertTo-SecureString $guestPw -AsPlainText -Force)
     $publicKey = Get-Content $PublicKeyPath -Raw
     $userData = @"
@@ -319,20 +399,45 @@ runcmd:
     $metaData = "instance-id: $VMName`nlocal-hostname: $VMName"
     $metaDataEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($metaData))
 
-    # 3) Create VM
+    # 4) Create VM
     try {
         $templateObj   = Get-Template     -Name $Template   -ErrorAction Stop
         $folderObj     = Get-Folder       -Name $Folder     -ErrorAction Stop
         $clusterObj    = Get-Cluster      -Name "vollminlab-ESXi-Cluster" -ErrorAction Stop
+        
+        # Check host readiness before creating VM and get available hosts
+        Test-VMHostReadiness -ClusterName "vollminlab-ESXi-Cluster" -VMName $VMName
+        
+        # Check template state
+        Write-LogEntry -VMName $VMName -Message ("Template '{0}' state: {1}" -f $Template, $templateObj.State)
+        
+        # Check datastore space
+        $datastores = Get-Datastore | Where-Object { $_.State -eq "Available" }
+        foreach ($ds in $datastores) {
+            $freeSpaceGB = [math]::Round($ds.FreeSpaceGB, 2)
+            Write-LogEntry -VMName $VMName -Message ("Datastore '{0}': {1}GB free" -f $ds.Name, $freeSpaceGB)
+        }
+        
+        # Get available hosts (not in maintenance mode) for explicit placement
+        $availableHosts = Get-VMHost -Location $clusterObj | Where-Object { $_.ConnectionState -eq "Connected" -and $_.State -ne "Maintenance" }
+        if ($availableHosts.Count -eq 0) {
+            throw "No available hosts found for VM deployment. All hosts are in maintenance mode or disconnected."
+        }
+        
+        # Select the first available host for explicit placement
+        $targetHost = $availableHosts | Select-Object -First 1
+        Write-LogEntry -VMName $VMName -Message ("Selected host '{0}' for VM deployment" -f $targetHost.Name)
+        
         $poolObj       = Get-ResourcePool -Location $clusterObj | Where-Object Name -eq "Resources"
-        $newVm         = New-VM           -Name $VMName -Template $templateObj -Location $folderObj -ResourcePool $poolObj -ErrorAction Stop
+        Write-LogEntry -VMName $VMName -Message ("Creating VM on host '{0}' with resource pool '{1}'" -f $targetHost.Name, $poolObj.Name)
+        $newVm         = New-VM           -Name $VMName -Template $templateObj -Location $folderObj -ResourcePool $poolObj -VMHost $targetHost -ErrorAction Stop
         Write-LogEntry -VMName $VMName -Message "New-VM succeeded"
     } catch {
         Write-LogEntry -VMName $VMName -Message ("New-VM FAILED: {0}" -f $_)
         throw
     }
 
-    # 4) Inject advanced settings
+    # 5) Inject advanced settings
     $settings = @(
         @{ Name = "guestinfo.userdata";           Value = $userDataEncoded },
         @{ Name = "guestinfo.userdata.encoding";  Value = "base64"       },
@@ -358,7 +463,58 @@ runcmd:
 
     Write-LogEntry -VMName $VMName -Message "Cloud-init data injected"
 
-    # 5) Power on
+    # 6) Modify VM resources if specified
+    if ($CPU -or $MemoryGB -or $DiskGB) {
+        Write-LogEntry -VMName $VMName -Message ("Modifying VM resources: CPU={0}, Memory={1}GB, Disk={2}GB" -f $CPU, $MemoryGB, $DiskGB)
+        
+        # Get current VM specs (not template specs, since VM was just created from template)
+        $currentMemory = $newVm.MemoryGB
+        $currentCPUs = $newVm.NumCpu
+        
+        # Modify CPU
+        if ($CPU -and $CPU -gt 0) {
+            if ($CPU -gt $currentCPUs) {
+                Write-LogEntry -VMName $VMName -Message ("Increasing CPU from {0} to {1}" -f $currentCPUs, $CPU)
+                Set-VM -VM $newVm -NumCpu $CPU -Confirm:$false
+            } elseif ($CPU -lt $currentCPUs) {
+                Write-LogEntry -VMName $VMName -Message ("Decreasing CPU from {0} to {1} (Warning: may impact performance)" -f $currentCPUs, $CPU)
+                Set-VM -VM $newVm -NumCpu $CPU -Confirm:$false
+            }
+        }
+        
+        # Modify Memory
+        if ($MemoryGB -and $MemoryGB -gt 0) {
+            if ($MemoryGB -gt $currentMemory) {
+                Write-LogEntry -VMName $VMName -Message ("Increasing Memory from {0}GB to {1}GB" -f $currentMemory, $MemoryGB)
+                Set-VM -VM $newVm -MemoryGB $MemoryGB -Confirm:$false
+            } elseif ($MemoryGB -lt $currentMemory) {
+                if ($MemoryGB -lt 2) {
+                    Write-LogEntry -VMName $VMName -Message ("WARNING: Memory {0}GB may be too low for proper operation" -f $MemoryGB)
+                }
+                Write-LogEntry -VMName $VMName -Message ("Decreasing Memory from {0}GB to {1}GB" -f $currentMemory, $MemoryGB)
+                Set-VM -VM $newVm -MemoryGB $MemoryGB -Confirm:$false
+            }
+        }
+        
+        # Modify Disk
+        if ($DiskGB -and $DiskGB -gt 0) {
+            $firstDisk = Get-HardDisk -VM $newVm | Select-Object -First 1
+            $currentDiskSize = [math]::Round($firstDisk.CapacityGB)
+            
+            if ($DiskGB -gt $currentDiskSize) {
+                Write-LogEntry -VMName $VMName -Message ("Expanding disk from {0}GB to {1}GB" -f $currentDiskSize, $DiskGB)
+                Set-HardDisk -HardDisk $firstDisk -CapacityGB $DiskGB -Confirm:$false
+            } elseif ($DiskGB -lt $currentDiskSize) {
+                Write-LogEntry -VMName $VMName -Message ("ERROR: Cannot shrink disk from {0}GB to {1}GB - VMware does not support disk shrinking" -f $currentDiskSize, $DiskGB)
+                Write-LogEntry -VMName $VMName -Message ("Skipping disk resize - keeping original size of {0}GB" -f $currentDiskSize)
+                # Don't attempt to shrink - VMware doesn't support it
+            }
+        }
+        
+        Write-LogEntry -VMName $VMName -Message "VM resource modification complete"
+    }
+
+    # 7) Power on
     if ($PowerOn) {
         Start-VM -VM $newVm -Confirm:$false | Out-Null
         Write-LogEntry -VMName $VMName -Message "VM powered on"
@@ -374,6 +530,9 @@ function Invoke-VMDeployment {
         [Parameter(Mandatory)][string]$TemplateName,
         [Parameter(Mandatory)][string]$IPAddress,
         [Parameter(Mandatory)][string]$VMFolder,
+        [int]$CPU,
+        [int]$MemoryGB,
+        [int]$DiskGB,
         [switch]$WhatIf,
         [switch]$PowerOn
     )
@@ -402,6 +561,9 @@ function Invoke-VMDeployment {
         -IPAddress     $IPAddress `
         -PublicKeyPath "C:\.ssh\converted\$VMName`_id_rsa.pub" `
         -GuestPassword $pwRef `
+        -CPU           $CPU `
+        -MemoryGB      $MemoryGB `
+        -DiskGB        $DiskGB `
         -WhatIf:$WhatIf `
         -PowerOn:$PowerOn
     if (-not $WhatIf) {
