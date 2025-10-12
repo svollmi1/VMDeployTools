@@ -153,6 +153,13 @@ function Clear-OpAuth {
   .EXAMPLE
       Clear-OpAuth
   #>
+  [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Low')]
+  param()
+  
+  if (-not $PSCmdlet.ShouldProcess("1Password authentication token", "Clear from session")) {
+    return
+  }
+  
   Remove-Item Env:OP_SERVICE_ACCOUNT_TOKEN -ErrorAction SilentlyContinue
   $script:OpAuthBootstrapped = $false
 }
@@ -279,10 +286,15 @@ function Add-DnsRecordToPiHole {
   .EXAMPLE
       Add-DnsRecordToPiHole -Fqdn "web01.vollminlab.com" -IPAddress "192.168.152.100"
   #>
+  [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Low')]
   param([Parameter(Mandatory)][string]$Fqdn,
         [Parameter(Mandatory)][string]$IPAddress)
+  
+  if (-not $PSCmdlet.ShouldProcess($Fqdn, "Add DNS A record to Pi-hole")) {
+    return
+  }
+  
   $vm = $Fqdn.Split('.')[0]
-  if ($WhatIfPreference) { return }
   
   $url   = "http://$($Script:PiHoleServer):$($Script:PiHolePort)/add-a-record"
   $token = Get-PiHoleApiToken
@@ -290,7 +302,7 @@ function Add-DnsRecordToPiHole {
   $body  = @{ domain = $Fqdn; ip = $IPAddress } | ConvertTo-Json
   try { 
     $response = Invoke-RestMethod -Uri $url -Method Post -Headers $hdr -Body $body
-    # Check if record already exists (idempotency)
+    # Check if record already exists
     if ($response.message -match "already exists") {
       Write-LogEntry -VMName $vm -Message "Pi-hole A record already exists for $Fqdn"
     } else {
@@ -318,9 +330,14 @@ function Remove-DnsRecordFromPiHole {
   .EXAMPLE
       Remove-DnsRecordFromPiHole -Fqdn "web01.vollminlab.com"
   #>
+  [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Low')]
   param([Parameter(Mandatory)][string]$Fqdn)
+  
+  if (-not $PSCmdlet.ShouldProcess($Fqdn, "Remove DNS A record from Pi-hole")) {
+    return
+  }
+  
   $vm = $Fqdn.Split('.')[0]
-  if ($WhatIfPreference) { return }
   
   $url   = "http://$($Script:PiHoleServer):$($Script:PiHolePort)/delete-a-record"
   $token = Get-PiHoleApiToken
@@ -437,9 +454,14 @@ function Save-SudoPasswordTo1Password {
   .EXAMPLE
       Save-SudoPasswordTo1Password -VMName "web01" -SecurePassword (ConvertTo-SecureString "pass123" -AsPlainText -Force)
   #>
+  [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Low')]
   param([Parameter(Mandatory)][string]$VMName,
         [Parameter(Mandatory)][SecureString]$SecurePassword,
         [string]$Vault = $Script:VaultName)
+
+  if (-not $PSCmdlet.ShouldProcess($VMName, "Save sudo password to 1Password")) {
+    return
+  }
 
   Initialize-OpAuth
   
@@ -488,7 +510,12 @@ function New-1PSSHKeyForHost {
   .EXAMPLE
       $key = New-1PSSHKeyForHost -HostName "webserver01"
   #>
+  [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Medium')]
   param([Parameter(Mandatory)][string]$HostName)
+
+  if (-not $PSCmdlet.ShouldProcess($HostName, "Create SSH key in 1Password")) {
+    return
+  }
 
   Initialize-OpAuth
   
@@ -553,9 +580,14 @@ function Add-SshConfigEntryLocal {
   .EXAMPLE
       Add-SshConfigEntryLocal -HostName "web01" -DnsName "web01.vollminlab.com" -PublicKeyPath "~/.ssh/web01_id_ed25519.pub"
   #>
+  [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Low')]
   param([Parameter(Mandatory)][string]$HostName,
         [Parameter(Mandatory)][string]$DnsName,
         [Parameter(Mandatory)][string]$PublicKeyPath)
+
+  if (-not $PSCmdlet.ShouldProcess($HostName, "Add SSH config entry")) {
+    return
+  }
 
   $conf = Join-Path $HOME '.ssh\config'
   if (-not (Test-Path $conf)) { New-Item -ItemType File -Path $conf -Force | Out-Null }
