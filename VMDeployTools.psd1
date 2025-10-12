@@ -8,24 +8,24 @@
     Description       = 'Automates VM deployments, sets DNS records in Pi-hole, generates SSH keys, manages cloud-init and logging.'
     PowerShellVersion = '5.1'
 
-    # -------------------------------------------------------------------------
-    # *** REMOVED RequiredModules to avoid cyclic dependency with VMware modules ***
-    # RequiredModules   = @('VMware.PowerCLI')
-    # -------------------------------------------------------------------------
-
+    RequiredModules   = @('VMware.PowerCLI')
     RequiredAssemblies = @()
 
     FunctionsToExport = @(
-        'Set-OpSession',
+        'Initialize-OpAuth',
+        'Clear-OpAuth',
         'Connect-ToVCenter',
         'Test-VMHostReadiness',
         'Invoke-VMDeployment',
         'Add-DnsRecordToPiHole',
         'Remove-DnsRecordFromPiHole',
-        'New-SshKeyPair',
-        'Add-SshConfigEntry',
+        'Save-SudoPasswordTo1Password',
+        'New-1PSSHKeyForHost',
+        'Add-SshConfigEntryLocal',
+        'Update-RemoteGladosSsh',
         'Install-VirtualMachine',
-        'Remove-VMDeployment'
+        'Remove-VMDeployment',
+        'Test-1PasswordSSHAgent'
     )
 
     CmdletsToExport   = @()

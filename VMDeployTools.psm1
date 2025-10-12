@@ -1,354 +1,815 @@
-# VMDeployTools.psm1
+<#
+.SYNOPSIS
+    VMDeployTools - Automated VM deployment with cloud-init, SSH key management, and DNS integration.
 
-# Global flag for console echo of logs
-$Script:VerboseLogging = $false
-
-function Write-LogEntry {
-    param(
-        [Parameter(Mandatory)][string]$VMName,
-        [Parameter(Mandatory)][string]$Message
-    )
-    $logDir = ".\logs"
-    if (-not (Test-Path $logDir)) {
-        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-    }
-    $logFile = Join-Path $logDir "$VMName.log"
-    $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    $line = ("[{0}] {1}" -f $timestamp, $Message)
-    Add-Content -Path $logFile -Value $line
-    if ($Script:VerboseLogging) { Write-Host $line }
-}
-
-function Set-OpSession {
-    if (-not (Get-Command op -ErrorAction SilentlyContinue)) {
-        Write-Error "1Password CLI not installed or not in PATH."
-        exit 1
-    }
-    try {
-        $whoami = op whoami
-        if (-not $whoami) {
-            Write-Host "Signing in to 1Password..."
-            Invoke-Expression (& op signin)
-        }
-    } catch {
-        Write-Host "Signing in to 1Password..."
-        Invoke-Expression (& op signin)
-    }
-}
-
-function Save-SudoPasswordTo1Password {
-    param(
-        [Parameter(Mandatory=$true)][string]$VMName,
-        [Parameter(Mandatory=$true)][SecureString]$SecurePassword,
-        [string]$Vault = 'homelab-vault'
-    )
-
-    # Ensure 1Password session
-    Set-OpSession
-
-    # Convert SecureString to plaintext
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
-    try {
-        $PlainPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-    } finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-    }
-
-    try {
-        # Check if item already exists
-        $existingItem = op item get $VMName --vault $Vault --format json 2>$null
-        if ($existingItem) {
-            # Item exists, update the password
-            op item edit $VMName --vault $Vault password=$PlainPassword
-            Write-LogEntry -VMName $VMName -Message "Sudo password updated in existing 1Password item '$VMName'"
-        } else {
-            # Item doesn't exist, create new one
-            op item create `
-                --vault $Vault `
-                --title $VMName `
-                --category login `
-                username=vollmin `
-                password=$PlainPassword `
-                --tags Homelab
-            Write-LogEntry -VMName $VMName -Message "Sudo password saved to new 1Password item '$VMName'"
-        }
-    } catch {
-        Write-LogEntry -VMName $VMName -Message ("ERROR saving sudo password to 1Password: {0}" -f $_)
-        throw
-    }
-}
-
-function Connect-ToVCenter {
-    param([switch]$WhatIf)
-    if ($WhatIf) {
-        Write-Host "[WhatIf] Would connect to vCenter"
-        return
-    }
-    if (-not (Get-Module VMware.PowerCLI -ListAvailable)) {
-        Install-Module -Name VMware.PowerCLI -Scope CurrentUser -Force
-    }
-    Import-Module VMware.PowerCLI -ErrorAction Stop
-    if (-not ($global:DefaultVIServer) -or $global:DefaultVIServer.IsConnected -ne $true) {
-        $cred = Get-Credential -Message "Enter vCenter credentials"
-        $conn = Connect-VIServer -Server "vcenter.vollminlab.com" -Credential $cred
-        if (-not $conn.IsConnected) {
-            throw "Failed to connect to vCenter."
-        }
-    }
-}
-
-function Test-VMHostReadiness {
-    param(
-        [Parameter(Mandatory)][string]$ClusterName,
-        [Parameter(Mandatory)][string]$VMName
-    )
+.DESCRIPTION
+    This module automates VM deployment in VMware vCenter with integrated SSH key management 
+    via 1Password, automatic DNS record creation in Pi-hole, and cloud-init configuration.
     
-    try {
-        $cluster = Get-Cluster -Name $ClusterName -ErrorAction Stop
-        $allHosts = Get-VMHost -Location $cluster
-        $hosts = $allHosts | Where-Object { $_.ConnectionState -eq "Connected" -and $_.State -ne "Maintenance" }
-        
-        # Log information about excluded hosts
-        $excludedHosts = $allHosts | Where-Object { $_.ConnectionState -ne "Connected" -or $_.State -eq "Maintenance" }
-        foreach ($excludedHost in $excludedHosts) {
-            Write-LogEntry -VMName $VMName -Message ("Excluded host '{0}': State={1}, ConnectionState={2}" -f $excludedHost.Name, $excludedHost.State, $excludedHost.ConnectionState)
-        }
-        
-        if ($hosts.Count -eq 0) {
-            throw "No suitable hosts found in cluster '$ClusterName'. All hosts may be in maintenance mode or disconnected."
-        }
-        
-        # Check for available resources and host state
-        foreach ($vmHost in $hosts) {
-            # Get CPU info - NumCpu is number of cores, CpuTotalMhz is total MHz available
-            $numCpu = $vmHost.NumCpu
-            $cpuTotalMhz = $vmHost.CpuTotalMhz
-            $cpuUsageMhz = $vmHost.CpuUsageMhz
-            $cpuAvailableMhz = $cpuTotalMhz - $cpuUsageMhz
-            $memoryAvailable = ($vmHost.MemoryTotalGB - $vmHost.MemoryUsageGB)
-            
-            Write-LogEntry -VMName $VMName -Message ("Host '{0}' status: {1} cores, CPU {2}/{3}MHz available ({4}%), Memory {5}GB available, State={6}, ConnectionState={7}" -f $vmHost.Name, $numCpu, $cpuAvailableMhz, $cpuTotalMhz, [math]::Round(($cpuAvailableMhz/$cpuTotalMhz)*100, 1), [math]::Round($memoryAvailable, 2), $vmHost.State, $vmHost.ConnectionState)
-            
-            # Check for resource constraints
-            if ($cpuAvailableMhz -lt 1000) {
-                Write-LogEntry -VMName $VMName -Message ("WARNING: Host '{0}' has less than 1GHz CPU available ({1}MHz)" -f $vmHost.Name, $cpuAvailableMhz)
-            }
-            if ($memoryAvailable -lt 1) {
-                Write-LogEntry -VMName $VMName -Message ("WARNING: Host '{0}' has less than 1GB memory available" -f $vmHost.Name)
-            }
-            
-            # Check for problematic host states
-            if ($vmHost.State -eq "Maintenance") {
-                Write-LogEntry -VMName $VMName -Message ("ERROR: Host '{0}' is in maintenance mode" -f $vmHost.Name)
-            }
-            if ($vmHost.ConnectionState -ne "Connected") {
-                Write-LogEntry -VMName $VMName -Message ("ERROR: Host '{0}' connection state is {1}" -f $vmHost.Name, $vmHost.ConnectionState)
-            }
-        }
-        
-        Write-LogEntry -VMName $VMName -Message ("Found {0} suitable hosts in cluster '{1}'" -f $hosts.Count, $ClusterName)
-        return $true
-        
-    } catch {
-        Write-LogEntry -VMName $VMName -Message ("Host readiness check FAILED: {0}" -f $_)
-        throw
+    Key features:
+    - Generates ed25519 SSH keypairs stored securely in 1Password
+    - Creates cloud-init enabled VMs from templates
+    - Automatically registers DNS records in Pi-hole
+    - Manages SSH config entries locally and on remote hosts
+    - Generates and stores random sudo passwords in 1Password
+
+.EXAMPLE
+    Import-Module .\VMDeployTools.psd1
+    
+.EXAMPLE
+    Invoke-VMDeployment -VMName "testvm" -TemplateName "Ubuntu-22.04-Template" `
+                        -IPAddress "192.168.152.100" -VMFolder "Lab" `
+                        -CPU 4 -MemoryGB 8 -DiskGB 50 -PowerOn
+
+.EXAMPLE
+    Remove-VMDeployment -VMName "testvm"
+
+.NOTES
+    Requires:
+    - VMware PowerCLI module
+    - 1Password CLI (op) installed and configured
+    - 1Password SSH agent running
+    - Access to vCenter and Pi-hole API
+#>
+
+# =========================
+# VMDeployTools.psm1
+# =========================
+
+# ---------- Settings ----------
+$Script:VerboseLogging          = $false
+$Script:VaultName               = 'Homelab'
+$Script:SvcTokenItemTitle       = 'VMDeploy-SSHKeyBroker Token'
+$Script:VCenterCredItemTitle    = 'vCenter local user SSO'
+$Script:RemoteUserProfileShare  = '\\glados\c$\Users\Scott\.ssh'
+$Script:RemoteConfigPath        = Join-Path $Script:RemoteUserProfileShare 'config'
+$Script:IsGlados                = ($env:COMPUTERNAME -ieq 'GLADOS')
+$Script:ClusterName             = 'vollminlab-ESXi-Cluster'
+$Script:Domain                  = 'vollminlab.com'
+$Script:VCenterServer           = 'vcenter.vollminlab.com'
+$Script:PiHoleServer            = 'pihole1.vollminlab.com'
+$Script:PiHolePort              = '5001'
+
+# ---------- 1Password Authentication State ----------
+# Memoization flag to avoid repeated authentication checks
+$script:OpAuthBootstrapped = $false
+
+# ---------- Logging ----------
+function Write-LogEntry {
+  <#
+  .SYNOPSIS
+      Writes a timestamped log entry to a VM-specific log file.
+  
+  .DESCRIPTION
+      Appends a timestamped message to a log file in the .\logs directory.
+      If verbose logging is enabled, also outputs to the console.
+  
+  .PARAMETER VMName
+      The VM name, used to determine the log file name.
+  
+  .PARAMETER Message
+      The message to log.
+  
+  .EXAMPLE
+      Write-LogEntry -VMName "web01" -Message "Deployment started"
+  #>
+  param(
+    [Parameter(Mandatory)][string]$VMName,
+    [Parameter(Mandatory)][string]$Message
+  )
+  $logDir = ".\logs"
+  if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+  $logFile = Join-Path $logDir "$VMName.log"
+  $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+  $line = ("[{0}] {1}" -f $timestamp, $Message)
+  Add-Content -Path $logFile -Value $line
+  if ($Script:VerboseLogging) { Write-Host $line }
+}
+
+# ---------- 1Password Authentication ----------
+function Initialize-OpAuth {
+  <#
+  .SYNOPSIS
+      Ensures 1Password CLI is authenticated for the current session.
+  
+  .DESCRIPTION
+      Lazy bootstrap pattern - only authenticates when first needed.
+      Checks for service account token, and if not present, performs one-time user signin
+      to fetch it from 1Password. Memoizes state to avoid repeated checks.
+  
+  .EXAMPLE
+      Initialize-OpAuth
+  #>
+  if (-not (Get-Command op -ErrorAction SilentlyContinue)) {
+    throw "1Password CLI not found in PATH."
+  }
+
+  # If already bootstrapped or SAT present, we're done
+  if ($script:OpAuthBootstrapped -or ($env:OP_SERVICE_ACCOUNT_TOKEN -and $env:OP_SERVICE_ACCOUNT_TOKEN.Trim())) {
+    $script:OpAuthBootstrapped = $true
+    return
+  }
+
+  # Try to read the SAT with whatever user auth we have
+  $satJson = & op item get $Script:SvcTokenItemTitle `
+    --vault $Script:VaultName `
+    --field password `
+    --reveal `
+    2>$null
+  
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($satJson)) {
+    # Not signed in; do a one-time signin (let desktop/biometric handle UI)
+    $token = & op signin --raw 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      throw "1Password sign-in failed. Output: $token"
     }
+    
+    # Try again to read SAT
+    $satJson = & op item get $Script:SvcTokenItemTitle `
+      --vault $Script:VaultName `
+      --field password `
+      --reveal `
+      2>&1
+    
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($satJson)) {
+      throw "Unable to read service account token item '$($Script:SvcTokenItemTitle)' in vault '$($Script:VaultName)'. Output: $satJson"
+    }
+  }
+
+  # Export the SAT for this process only
+  [Environment]::SetEnvironmentVariable('OP_SERVICE_ACCOUNT_TOKEN', $satJson.Trim(), 'Process')
+  $script:OpAuthBootstrapped = $true
+}
+
+function Clear-OpAuth {
+  <#
+  .SYNOPSIS
+      Clears the 1Password authentication token from the current session.
+  
+  .DESCRIPTION
+      Removes the service account token from the environment and resets the bootstrap flag.
+      Useful for security compliance or when you want to ensure the token is cleared after operations.
+  
+  .EXAMPLE
+      Clear-OpAuth
+  #>
+  Remove-Item Env:OP_SERVICE_ACCOUNT_TOKEN -ErrorAction SilentlyContinue
+  $script:OpAuthBootstrapped = $false
+}
+
+# ---------- Utility ----------
+function Test-1PasswordSSHAgent {
+  <#
+  .SYNOPSIS
+      Validates that 1Password SSH agent is available.
+  
+  .DESCRIPTION
+      Checks for the SSH agent pipe and 1Password process to ensure the SSH agent is 
+      properly configured and running. Throws an error if the SSH agent pipe is not found.
+      Issues a warning if 1Password is not detected.
+  
+  .EXAMPLE
+      Test-1PasswordSSHAgent
+  #>
+  $pipe = Get-ChildItem \\.\pipe\ -ErrorAction SilentlyContinue | 
+          Where-Object Name -eq 'openssh-ssh-agent'
+  $op1p = Get-Process -Name "1Password" -ErrorAction SilentlyContinue
+  
+  if (-not $pipe) { 
+    throw "SSH agent pipe not found at \\.\pipe\openssh-ssh-agent. Is an SSH agent running?"
+  }
+  if (-not $op1p) { 
+    Write-Warning "1Password process not detected. Ensure 1Password is running with SSH agent enabled."
+    Write-Warning "If Windows SSH agent is running instead of 1Password agent, SSH key access will fail."
+  }
+  return $true
 }
 
 function New-RandomPassword {
-    param (
-        [int]$Length = 20
-    )
-
-    $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_-+=<>?'
-    -join (1..$Length | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+  <#
+  .SYNOPSIS
+      Generates a random password.
+  
+  .DESCRIPTION
+      Creates a cryptographically random password using alphanumeric and special characters.
+  
+  .PARAMETER Length
+      Optional. The length of the password (default: 24).
+  
+  .EXAMPLE
+      $password = New-RandomPassword -Length 32
+  #>
+  param([int]$Length = 24)
+  $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_-+=<>?'
+  -join (1..$Length | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
 }
 
 function ConvertTo-SHA512Crypt {
-    [CmdletBinding()]
-    param([SecureString]$Password)
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
-    try {
-        $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-    } finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-    }
-    $saltBytes = New-Object byte[] 6
-    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($saltBytes)
-    $salt = [Convert]::ToBase64String($saltBytes).TrimEnd('=') -replace '[^a-zA-Z0-9]'
-    $hash = [Security.Cryptography.SHA512]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($plain))
-    $hashText = [Convert]::ToBase64String($hash)
-    return ('$6${0}${1}' -f $salt, $hashText)
+  <#
+  .SYNOPSIS
+      Converts a password to SHA512 crypt format for Linux.
+  
+  .DESCRIPTION
+      Generates a SHA512 password hash compatible with Linux /etc/shadow format.
+      Used for cloud-init password configuration.
+  
+  .PARAMETER Password
+      The password as a SecureString.
+  
+  .OUTPUTS
+      String in format: $6$salt$hash
+  
+  .EXAMPLE
+      $hash = ConvertTo-SHA512Crypt -Password (ConvertTo-SecureString "password123" -AsPlainText -Force)
+  #>
+  [CmdletBinding()] param([SecureString]$Password)
+  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+  try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+  finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+  $saltBytes = New-Object byte[] 6
+  [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($saltBytes)
+  $salt = [Convert]::ToBase64String($saltBytes).TrimEnd('=') -replace '[^a-zA-Z0-9]'
+  $hash = [Security.Cryptography.SHA512]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($plain))
+  $hashText = [Convert]::ToBase64String($hash)
+  return ('$6${0}${1}' -f $salt, $hashText)
 }
 
+# ---------- DNS (Pi-hole) ----------
 function Get-PiHoleApiToken {
-    Set-OpSession
-
-    # Retrieve the token field from the 1Password item
-    $token = op item get "recordimporter-api-token" `
-        --vault "homelab-vault" `
-        --field password `
-        --format human-readable `
-        --reveal
-
-    if (-not $token) {
-        throw "Failed to retrieve Pi-hole API token from 1Password"
-    }
-    return $token.Trim()
+  <#
+  .SYNOPSIS
+      Retrieves the Pi-hole API token from 1Password.
+  
+  .DESCRIPTION
+      Fetches the API token for the Pi-hole record importer service from 1Password.
+      Uses service account for headless operation.
+  
+  .EXAMPLE
+      $token = Get-PiHoleApiToken
+  #>
+  Initialize-OpAuth
+  
+  $token = & op item get "recordimporter-api-token" `
+              --vault $Script:VaultName `
+              --field password `
+              --format human-readable `
+              --reveal
+  
+  if ([string]::IsNullOrWhiteSpace($token)) { 
+    throw "Failed to retrieve Pi-hole API token from 1Password" 
+  }
+  return $token.Trim()
 }
 
 function Add-DnsRecordToPiHole {
-    param(
-        [Parameter(Mandatory)][string]$Domain,
-        [Parameter(Mandatory)][string]$IPAddress,
-        [switch]$WhatIf
-    )
-    $vm = $Domain.Split('.')[0]
-    if ($WhatIf) {
-        Write-Host "[WhatIf] Would add DNS A record for $Domain -> $IPAddress"
-        return
+  <#
+  .SYNOPSIS
+      Adds a DNS A record to Pi-hole.
+  
+  .DESCRIPTION
+      Creates a new DNS A record in Pi-hole via the REST API. Retrieves the API token 
+      from 1Password automatically.
+  
+  .PARAMETER Fqdn
+      The fully qualified domain name for the record.
+  
+  .PARAMETER IPAddress
+      The IP address to associate with the domain.
+  
+  .EXAMPLE
+      Add-DnsRecordToPiHole -Fqdn "web01.vollminlab.com" -IPAddress "192.168.152.100"
+  #>
+  param([Parameter(Mandatory)][string]$Fqdn,
+        [Parameter(Mandatory)][string]$IPAddress)
+  $vm = $Fqdn.Split('.')[0]
+  if ($WhatIfPreference) { return }
+  
+  $url   = "http://$($Script:PiHoleServer):$($Script:PiHolePort)/add-a-record"
+  $token = Get-PiHoleApiToken
+  $hdr   = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
+  $body  = @{ domain = $Fqdn; ip = $IPAddress } | ConvertTo-Json
+  try { 
+    $response = Invoke-RestMethod -Uri $url -Method Post -Headers $hdr -Body $body
+    # Check if record already exists (idempotency)
+    if ($response.message -match "already exists") {
+      Write-LogEntry -VMName $vm -Message "Pi-hole A record already exists for $Fqdn"
+    } else {
+      Write-LogEntry -VMName $vm -Message "Added Pi-hole A record for $Fqdn -> $IPAddress"
     }
-    Write-LogEntry -VMName $vm -Message ("Add-DnsRecord START {0}->{1}" -f $Domain, $IPAddress)
-    $url   = "http://pihole1.vollminlab.com:5001/add-a-record"
-    $token = Get-PiHoleApiToken
-    $hdr   = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
-    $body  = @{ domain = $Domain; ip = $IPAddress } | ConvertTo-Json
-    try {
-        Invoke-RestMethod -Uri $url -Method Post -Headers $hdr -Body $body
-        Write-LogEntry -VMName $vm -Message ("A record added for {0}->{1}" -f $Domain, $IPAddress)
-    } catch {
-        Write-LogEntry -VMName $vm -Message ("Add-DnsRecord ERROR: {0}" -f $_)
-    }
-    Write-LogEntry -VMName $vm -Message "Add-DnsRecord COMPLETE"
+  }
+  catch { 
+    $status = $_.Exception.Response?.StatusCode ?? "Unknown"
+    Write-LogEntry -VMName $vm -Message ("Failed to add Pi-hole A record: Status=$status, Error=$_")
+  }
 }
 
 function Remove-DnsRecordFromPiHole {
-    param(
-        [Parameter(Mandatory)][string]$Domain,
-        [switch]$WhatIf
-    )
-
-    $vm = $Domain.Split('.')[0]
-    if ($WhatIf) {
-        Write-Host "[WhatIf] Would remove DNS A record for $Domain"
-        return
-    }
-
-    Write-LogEntry -VMName $vm -Message ("Remove-DnsRecord START {0}" -f $Domain)
-
-    $url   = "http://pihole1.vollminlab.com:5001/delete-a-record"
-    $token = Get-PiHoleApiToken
-    $hdr   = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
-    $body  = @{ domain = $Domain } | ConvertTo-Json
-
-    try {
-        Invoke-RestMethod -Uri $url -Method Delete -Headers $hdr -Body $body
-        Write-LogEntry -VMName $vm -Message ("A record deleted for {0}" -f $Domain)
-    } catch {
-        Write-LogEntry -VMName $vm -Message ("Remove-DnsRecord ERROR: {0}" -f $_)
-    }
-
-    Write-LogEntry -VMName $vm -Message "Remove-DnsRecord COMPLETE"
+  <#
+  .SYNOPSIS
+      Removes a DNS A record from Pi-hole.
+  
+  .DESCRIPTION
+      Deletes a DNS A record from Pi-hole via the REST API. Retrieves the API token 
+      from 1Password automatically.
+  
+  .PARAMETER Fqdn
+      The fully qualified domain name to remove.
+  
+  .EXAMPLE
+      Remove-DnsRecordFromPiHole -Fqdn "web01.vollminlab.com"
+  #>
+  param([Parameter(Mandatory)][string]$Fqdn)
+  $vm = $Fqdn.Split('.')[0]
+  if ($WhatIfPreference) { return }
+  
+  $url   = "http://$($Script:PiHoleServer):$($Script:PiHolePort)/delete-a-record"
+  $token = Get-PiHoleApiToken
+  $hdr   = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
+  $body  = @{ domain = $Fqdn } | ConvertTo-Json
+  try { 
+    Invoke-RestMethod -Uri $url -Method Delete -Headers $hdr -Body $body | Out-Null
+    Write-LogEntry -VMName $vm -Message "Deleted Pi-hole A record for $Fqdn" 
+  }
+  catch { 
+    $status = $_.Exception.Response?.StatusCode ?? "Unknown"
+    Write-LogEntry -VMName $vm -Message ("Failed to delete Pi-hole A record: Status=$status, Error=$_")
+  }
 }
 
-function New-SshKeyPair {
-    param(
-        [Parameter(Mandatory)][string]$KeyPath,
-        [switch]$WhatIf,
-        [ref]$Passphrase
-    )
-    $vm = [IO.Path]::GetFileNameWithoutExtension($KeyPath)
-    if ($WhatIf) {
-        Write-Host "[WhatIf] Would generate SSH key at $KeyPath"
-        return
+# ---------- vCenter ----------
+function Connect-ToVCenter {
+  <#
+  .SYNOPSIS
+      Establishes a connection to vCenter if not already connected.
+  
+  .DESCRIPTION
+      Checks for an existing vCenter connection and establishes a new one if needed.
+      Retrieves credentials from 1Password automatically. Automatically installs VMware.PowerCLI 
+      module if not present.
+  
+  .EXAMPLE
+      Connect-ToVCenter
+  #>
+  if (-not (Get-Module VMware.PowerCLI -ListAvailable)) { Install-Module -Name VMware.PowerCLI -Scope CurrentUser -Force }
+  Import-Module VMware.PowerCLI -ErrorAction Stop
+  
+  # Configure PowerCLI to ignore invalid certificates (for self-signed certs)
+  Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
+  
+  if (-not ($global:DefaultVIServer) -or $global:DefaultVIServer.IsConnected -ne $true) {
+    # Get credentials from 1Password
+    Initialize-OpAuth
+    $username = op item get $Script:VCenterCredItemTitle --vault $Script:VaultName --field username --format human-readable
+    $password = op item get $Script:VCenterCredItemTitle --vault $Script:VaultName --field password --format human-readable --reveal
+    
+    if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($password)) {
+      throw "Failed to retrieve vCenter credentials from 1Password item '$Script:VCenterCredItemTitle'"
     }
-    Write-LogEntry -VMName $vm -Message ("New-SshKeyPair START Path={0}" -f $KeyPath)
-    $dir = Split-Path $KeyPath
-    if (-not (Test-Path $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    }
-    if (-not (Test-Path $KeyPath)) {
-        $pw = New-RandomPassword
-        $Passphrase.Value = $pw
-        ssh-keygen -t rsa -b 2048 -f $KeyPath -N $pw -q
-        Write-LogEntry -VMName $vm -Message ("SSH key generated, passphrase={0}" -f $pw)
-    }
-    Write-LogEntry -VMName $vm -Message "New-SshKeyPair COMPLETE"
+    
+    $securePassword = ConvertTo-SecureString $password.Trim() -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($username.Trim(), $securePassword)
+    
+    $conn = Connect-VIServer -Server $Script:VCenterServer -Credential $cred
+    if (-not $conn.IsConnected) { throw "Failed to connect to vCenter." }
+  }
 }
 
-function Add-SshConfigEntry {
-    param(
-        [Parameter(Mandatory)][string]$HostName,
+function Test-VMHostReadiness {
+  <#
+  .SYNOPSIS
+      Validates that ESXi hosts in a cluster are ready for VM deployment.
+  
+  .DESCRIPTION
+      Checks all hosts in the specified cluster for connectivity and maintenance status.
+      Logs resource availability (CPU, memory) for each suitable host. Throws an error if 
+      no suitable hosts are found.
+  
+  .PARAMETER ClusterName
+      The name of the vCenter cluster to check.
+  
+  .PARAMETER VMName
+      The VM name, used for logging purposes.
+  
+  .EXAMPLE
+      Test-VMHostReadiness -ClusterName "Production-Cluster" -VMName "web01"
+  #>
+  param([Parameter(Mandatory)][string]$ClusterName,
+        [Parameter(Mandatory)][string]$VMName)
+  try {
+    $cluster  = Get-Cluster -Name $ClusterName -ErrorAction Stop
+    $allHosts = Get-VMHost -Location $cluster
+    $hosts    = $allHosts | Where-Object { $_.ConnectionState -eq "Connected" -and $_.State -ne "Maintenance" }
+    $excluded = $allHosts | Where-Object { $_.ConnectionState -ne "Connected" -or $_.State -eq "Maintenance" }
+    foreach ($h in $excluded) { Write-LogEntry -VMName $VMName -Message ("Excluded host '{0}': State={1}, ConnectionState={2}" -f $h.Name,$h.State,$h.ConnectionState) }
+    if ($hosts.Count -eq 0) { throw "No suitable hosts found in cluster '$ClusterName'." }
+    foreach ($vmHost in $hosts) {
+      $cpuAvail = $vmHost.CpuTotalMhz - $vmHost.CpuUsageMhz
+      $memAvail = $vmHost.MemoryTotalGB - $vmHost.MemoryUsageGB
+      Write-LogEntry -VMName $VMName -Message ("Host '{0}': CPU {1}/{2}MHz free, Mem {3}GB free, State={4}, Conn={5}" -f $vmHost.Name,$cpuAvail,$vmHost.CpuTotalMhz,[math]::Round($memAvail,2),$vmHost.State,$vmHost.ConnectionState)
+    }
+    Write-LogEntry -VMName $VMName -Message ("Found {0} suitable hosts in cluster '{1}'" -f $hosts.Count, $ClusterName)
+    return $true
+  } catch {
+    Write-LogEntry -VMName $VMName -Message ("Host readiness check FAILED: {0}" -f $_)
+    throw
+  }
+}
+
+# ---------- 1Password items ----------
+function Save-SudoPasswordTo1Password {
+  <#
+  .SYNOPSIS
+      Saves or updates a VM's sudo password in 1Password.
+  
+  .DESCRIPTION
+      Creates or updates a login item in 1Password with the VM's sudo password.
+      The item is tagged for easy identification and organization.
+  
+  .PARAMETER VMName
+      The VM name, used as the 1Password item title.
+  
+  .PARAMETER SecurePassword
+      The password as a SecureString.
+  
+  .PARAMETER Vault
+      Optional. The 1Password vault name (defaults to script variable).
+  
+  .EXAMPLE
+      Save-SudoPasswordTo1Password -VMName "web01" -SecurePassword (ConvertTo-SecureString "pass123" -AsPlainText -Force)
+  #>
+  param([Parameter(Mandatory)][string]$VMName,
+        [Parameter(Mandatory)][SecureString]$SecurePassword,
+        [string]$Vault = $Script:VaultName)
+
+  Initialize-OpAuth
+  
+  # Convert SecureString to plain text for 1Password CLI
+  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
+  try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+  finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+
+  try {
+    $exists = op item get $VMName --vault $Vault --format json 2>$null
+    if ($exists) {
+      op item edit $VMName --vault $Vault password=$plain | Out-Null
+      Write-LogEntry -VMName $VMName -Message "Updated sudo password in 1Password '$VMName'"
+    } else {
+      op item create --vault $Vault --title $VMName --category login `
+        username=vollmin password=$plain --tags Homelab | Out-Null
+      Write-LogEntry -VMName $VMName -Message "Created sudo credential in 1Password '$VMName'"
+    }
+  } catch {
+    Write-LogEntry -VMName $VMName -Message ("ERROR saving sudo password to 1Password: {0}" -f $_)
+    throw
+  }
+}
+
+function New-1PSSHKeyForHost {
+  <#
+  .SYNOPSIS
+      Generates a new SSH keypair for a host and stores it in 1Password.
+  
+  .DESCRIPTION
+      Creates an ed25519 SSH keypair with a random passphrase, uploads both keys and the 
+      passphrase to 1Password as an SSH Key item, saves the public key locally, and securely 
+      removes the private key from disk. The 1Password SSH agent will provide the private key 
+      when needed.
+  
+  .PARAMETER HostName
+      The name of the host this SSH key is for. Used in the key title and comment.
+  
+  .OUTPUTS
+      PSCustomObject with properties:
+      - Title: The 1Password item title
+      - PublicKeyText: The public key content
+      - PublicKeyPathLocal: Local path to the saved public key file
+      - Passphrase: The generated passphrase (for informational purposes)
+  
+  .EXAMPLE
+      $key = New-1PSSHKeyForHost -HostName "webserver01"
+  #>
+  param([Parameter(Mandatory)][string]$HostName)
+
+  Initialize-OpAuth
+  
+  $title = "${HostName}_id_ed25519"
+
+  # Generate SSH key directly in 1Password using op item create
+  # This is the correct way per 1Password CLI documentation
+  $result = & op item create `
+    --vault $Script:VaultName `
+    --category "SSH Key" `
+    --title $title `
+    --tags "Homelab,AutoProvisioned" `
+    --ssh-generate-key "ed25519" 2>&1
+  
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to create SSH Key item in 1Password. Error: $result"
+  }
+
+  # Get the public key from the newly created item
+  $pub = & op item get $title `
+    --vault $Script:VaultName `
+    --field "public key" `
+    --format human-readable
+  
+  if ([string]::IsNullOrWhiteSpace($pub)) {
+    throw "Failed to retrieve public key from newly created SSH Key item"
+  }
+
+  # Write PUBLIC key locally to ~/.ssh
+  $localSsh = Join-Path $HOME '.ssh'
+  if (-not (Test-Path $localSsh)) { New-Item -ItemType Directory -Path $localSsh -Force | Out-Null }
+  $pubOut = Join-Path $localSsh ($title + '.pub')
+  Set-Content -Path $pubOut -Value $pub.Trim() -Encoding ASCII -NoNewline
+
+  return [pscustomobject]@{
+    Title             = $title
+    PublicKeyText     = $pub.Trim()
+    PublicKeyPathLocal= $pubOut
+    Passphrase        = $null
+  }
+}
+
+# ---------- SSH config helpers ----------
+function Add-SshConfigEntryLocal {
+  <#
+  .SYNOPSIS
+      Adds an SSH config entry to the local ~/.ssh/config file.
+  
+  .DESCRIPTION
+      Creates a Host block in the local SSH config file with the specified hostname, 
+      DNS name, and identity file path. Skips if entry already exists.
+  
+  .PARAMETER HostName
+      The SSH host alias to use.
+  
+  .PARAMETER DnsName
+      The fully qualified domain name or IP address.
+  
+  .PARAMETER PublicKeyPath
+      Path to the public key file (for 1Password SSH agent).
+  
+  .EXAMPLE
+      Add-SshConfigEntryLocal -HostName "web01" -DnsName "web01.vollminlab.com" -PublicKeyPath "~/.ssh/web01_id_ed25519.pub"
+  #>
+  param([Parameter(Mandatory)][string]$HostName,
         [Parameter(Mandatory)][string]$DnsName,
-        [Parameter(Mandatory)][string]$KeyPath,
-        [switch]$WhatIf
-    )
-    $conf = Join-Path $HOME '.ssh\config'
-    if ($WhatIf) {
-        Write-Host "[WhatIf] Would add SSH config for $HostName"
-        return
-    }
-    Write-LogEntry -VMName $HostName -Message "Add-SshConfig START"
-    if (-not (Test-Path $conf)) {
-        New-Item -ItemType File -Path $conf -Force | Out-Null
-    }
-    if (-not (Select-String -Path $conf -Pattern "^Host\s+$HostName" -Quiet)) {
-        $entry = @"
+        [Parameter(Mandatory)][string]$PublicKeyPath)
+
+  $conf = Join-Path $HOME '.ssh\config'
+  if (-not (Test-Path $conf)) { New-Item -ItemType File -Path $conf -Force | Out-Null }
+
+  if (-not (Select-String -Path $conf -Pattern "^Host\s+$([regex]::Escape($HostName))\$" -Quiet)) {
+    $entry = @"
 Host $HostName
-    HostName $DnsName
-    User vollmin
-    IdentityFile $KeyPath
-    IdentitiesOnly yes
+  HostName $DnsName
+  User vollmin
+  IdentitiesOnly yes
+  IdentityFile $PublicKeyPath
 "@
-        Add-Content -Path $conf -Value $entry
-        Write-LogEntry -VMName $HostName -Message "SSH config added"
-    }
-    Write-LogEntry -VMName $HostName -Message "Add-SshConfig COMPLETE"
+    Add-Content -Path $conf -Value $entry
+  }
 }
 
+function Update-RemoteGladosSsh {
+  <#
+  .SYNOPSIS
+      Updates SSH configuration on a remote GLaDOS host.
+  
+  .DESCRIPTION
+      Mirrors SSH public key and config entry to a remote host via network share.
+      Returns false if the share is inaccessible. Used to ensure SSH access from 
+      multiple locations.
+  
+  .PARAMETER HostName
+      The SSH host alias.
+  
+  .PARAMETER DnsName
+      The fully qualified domain name or IP address.
+  
+  .PARAMETER PublicKeyText
+      The public key content as a string.
+  
+  .PARAMETER PublicKeyFileName
+      The filename for the public key (e.g., "web01_id_ed25519.pub").
+  
+  .EXAMPLE
+      Update-RemoteGladosSsh -HostName "web01" -DnsName "web01.vollminlab.com" `
+                             -PublicKeyText $keyContent -PublicKeyFileName "web01_id_ed25519.pub"
+  #>
+  param([Parameter(Mandatory)][string]$HostName,
+        [Parameter(Mandatory)][string]$DnsName,
+        [Parameter(Mandatory)][string]$PublicKeyText,
+        [Parameter(Mandatory)][string]$PublicKeyFileName)
+
+  try {
+    # Ensure remote dir
+    if (-not (Test-Path $Script:RemoteUserProfileShare)) {
+      # If share not present/accessible, just bail quietly
+      Write-LogEntry -VMName $HostName -Message "Remote GLaDOS share not accessible: $Script:RemoteUserProfileShare"
+      return $false
+    }
+    # Write public key
+    $remotePub = Join-Path $Script:RemoteUserProfileShare $PublicKeyFileName
+    Set-Content -Path $remotePub -Value $PublicKeyText -Encoding ASCII -NoNewline
+
+    # Append host block if missing
+    if (-not (Test-Path $Script:RemoteConfigPath)) {
+      New-Item -ItemType File -Path $Script:RemoteConfigPath -Force | Out-Null
+    }
+    $hasHost = Select-String -Path $Script:RemoteConfigPath -Pattern "^Host\s+$([regex]::Escape($HostName))\$" -Quiet
+    if (-not $hasHost) {
+      $entry = @"
+Host $HostName
+  HostName $DnsName
+  User vollmin
+  IdentitiesOnly yes
+  IdentityFile ~/.ssh/$PublicKeyFileName
+"@
+      Add-Content -Path $Script:RemoteConfigPath -Value $entry
+    }
+    return $true
+  } catch {
+    Write-LogEntry -VMName $HostName -Message "Remote GLaDOS update failed: $_"
+    return $false
+  }
+}
+
+function Remove-HostBlockFromConfig {
+  <#
+  .SYNOPSIS
+      Removes a Host block from an SSH config file.
+  
+  .DESCRIPTION
+      Parses an SSH config file and removes the specified Host block including all 
+      indented lines that belong to it.
+  
+  .PARAMETER HostName
+      The hostname to remove from the config.
+  
+  .PARAMETER ConfigPath
+      The path to the SSH config file.
+  
+  .EXAMPLE
+      Remove-HostBlockFromConfig -HostName "web01" -ConfigPath "~/.ssh/config"
+  #>
+  param([Parameter(Mandatory)][string]$HostName,
+        [Parameter(Mandatory)][string]$ConfigPath)
+
+  if (-not (Test-Path $ConfigPath)) { return }
+  $lines = Get-Content $ConfigPath
+  $out = New-Object System.Collections.Generic.List[string]
+  $skip = $false
+  foreach ($line in $lines) {
+    # Check if this is the Host block we want to remove
+    if ($line -match "^Host\s+$([regex]::Escape($HostName))\s*$") { 
+      $skip = $true
+      continue 
+    }
+    # If we're skipping and the line is indented (part of the Host block), skip it
+    if ($skip -and ($line -match '^\s+' -or [string]::IsNullOrWhiteSpace($line))) { 
+      continue 
+    }
+    # If we hit a non-indented line, stop skipping
+    if ($skip) { 
+      $skip = $false 
+    }
+    [void]$out.Add($line)
+  }
+  $out | Set-Content $ConfigPath -Encoding UTF8
+}
+
+function Remove-HostFromKnownHosts {
+  <#
+  .SYNOPSIS
+      Removes a host entry from SSH known_hosts file.
+  
+  .DESCRIPTION
+      Searches for and removes all entries matching the given hostname or IP address
+      from the SSH known_hosts file. This prevents SSH from showing host key warnings
+      when the host is recreated.
+  
+  .PARAMETER HostName
+      The hostname to remove (can be hostname, FQDN, or IP address).
+  
+  .PARAMETER KnownHostsPath
+      The path to the known_hosts file.
+  
+  .EXAMPLE
+      Remove-HostFromKnownHosts -HostName "web01.vollminlab.com" -KnownHostsPath "~/.ssh/known_hosts"
+  #>
+  param([Parameter(Mandatory)][string]$HostName,
+        [Parameter(Mandatory)][string]$KnownHostsPath)
+
+  if (-not (Test-Path $KnownHostsPath)) { return }
+  
+  $lines = Get-Content $KnownHostsPath
+  $out = New-Object System.Collections.Generic.List[string]
+  
+  foreach ($line in $lines) {
+    # Skip empty lines or comments
+    if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) {
+      [void]$out.Add($line)
+      continue
+    }
+    
+    # Known_hosts format: hostname[,hostname...] keytype publickey
+    # Check if this line contains our hostname
+    $hostPart = $line.Split(' ')[0]
+    if ($hostPart -match [regex]::Escape($HostName)) {
+      # Skip this line (remove it)
+      continue
+    }
+    
+    [void]$out.Add($line)
+  }
+  
+  $out | Set-Content $KnownHostsPath -Encoding UTF8
+}
+
+# ---------- Cloud-init VM build ----------
 function Install-VirtualMachine {
-    param(
-        [Parameter(Mandatory)][string]$VMName,
-        [Parameter(Mandatory)][string]$Template,
-        [Parameter(Mandatory)][string]$Folder,
-        [Parameter(Mandatory)][string]$IPAddress,
-        [Parameter(Mandatory)][string]$PublicKeyPath,
-        [ref]$GuestPassword,
-        [int]$CPU,
-        [int]$MemoryGB,
-        [int]$DiskGB,
-        [switch]$WhatIf,
-        [switch]$PowerOn
-    )
-    if ($WhatIf) {
-        Write-Host "[WhatIf] Would deploy VM $VMName"
-        if ($CPU -or $MemoryGB -or $DiskGB) {
-            Write-Host "[WhatIf] Would modify resources: CPU=$CPU, Memory=${MemoryGB}GB, Disk=${DiskGB}GB"
-        }
-        Write-Host "[WhatIf] Would save sudo password to 1Password"
-        return
-    }
-    Write-LogEntry -VMName $VMName -Message "Install-VirtualMachine START"
+  <#
+  .SYNOPSIS
+      Creates a new VM from a template with cloud-init configuration.
+  
+  .DESCRIPTION
+      Performs the actual VM creation in vCenter including:
+      - Cloning from template
+      - Injecting cloud-init user-data and metadata via guestinfo
+      - Configuring CPU, memory, and disk resources
+      - Optionally powering on the VM
+      Generates and stores a random sudo password in 1Password.
+  
+  .PARAMETER VMName
+      The name of the VM to create.
+  
+  .PARAMETER Template
+      The vCenter template name to clone from.
+  
+  .PARAMETER Folder
+      The vCenter folder where the VM will be created.
+  
+  .PARAMETER IPAddress
+      The static IP address for the VM.
+  
+  .PARAMETER PublicKeyText
+      The SSH public key to inject for the user account.
+  
+  .PARAMETER GuestPassword
+      A reference variable to receive the generated password.
+  
+  .PARAMETER CPU
+      Optional. Number of CPUs to assign.
+  
+  .PARAMETER MemoryGB
+      Optional. Memory in GB to assign.
+  
+  .PARAMETER DiskGB
+      Optional. Disk size in GB (can only grow, not shrink).
+  
+  .PARAMETER PowerOn
+      If specified, powers on the VM after creation.
+  
+  .EXAMPLE
+      $pwRef = [ref]""
+      Install-VirtualMachine -VMName "web01" -Template "Ubuntu-22.04" -Folder "Lab" `
+                             -IPAddress "192.168.152.100" -PublicKeyText $pubKey `
+                             -GuestPassword $pwRef -PowerOn
+  #>
+  param(
+    [Parameter(Mandatory)][string]$VMName,
+    [Parameter(Mandatory)][string]$Template,
+    [Parameter(Mandatory)][string]$Folder,
+    [Parameter(Mandatory)][string]$IPAddress,
+    [Parameter(Mandatory)][string]$PublicKeyText,
+    [ref]$GuestPassword,
+    [int]$CPU,
+    [int]$MemoryGB,
+    [int]$DiskGB,
+    [switch]$PowerOn
+  )
+  Write-LogEntry -VMName $VMName -Message "Install-VirtualMachine START"
 
-    # 1) Check if VM already exists first (before generating password)
-    $existingVm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
-    if ($existingVm) {
-        Write-LogEntry -VMName $VMName -Message ("ERROR: VM '{0}' already exists with state: {1}" -f $VMName, $existingVm.PowerState)
-        throw "VM '$VMName' already exists. Please remove it manually before deploying a new one."
-    }
+  # 1) Ensure new VM does not already exist
+  $existingVm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
+  if ($existingVm) {
+    Write-LogEntry -VMName $VMName -Message ("ERROR: VM '{0}' already exists (state: {1})" -f $VMName, $existingVm.PowerState)
+    throw "VM '$VMName' already exists."
+  }
 
-    # 2) Generate sudo password (only after confirming VM doesn't exist)
-    $guestPw = New-RandomPassword
-    $GuestPassword.Value = $guestPw
-    Save-SudoPasswordTo1Password -VMName $VMName -SecurePassword (ConvertTo-SecureString $guestPw -AsPlainText -Force)
+  # 2) Sudo secret
+  $guestPw = New-RandomPassword
+  $GuestPassword.Value = $guestPw
+  Save-SudoPasswordTo1Password -VMName $VMName -SecurePassword (ConvertTo-SecureString $guestPw -AsPlainText -Force)
 
-    # 3) cloud-init
-    $hashedPw = ConvertTo-SHA512Crypt -Password (ConvertTo-SecureString $guestPw -AsPlainText -Force)
-    $publicKey = Get-Content $PublicKeyPath -Raw
-    $userData = @"
+  # 3) cloud-init
+  $hashedPw  = ConvertTo-SHA512Crypt -Password (ConvertTo-SecureString $guestPw -AsPlainText -Force)
+  $userData = @"
 #cloud-config
 hostname: $VMName
-fqdn: $VMName.vollminlab.com
+fqdn: $VMName.$($Script:Domain)
 manage_etc_hosts: true
 
 users:
@@ -358,7 +819,7 @@ users:
     lock_passwd: false
     passwd: $hashedPw
     ssh_authorized_keys:
-      - $publicKey
+      - $PublicKeyText
 
 ssh_pwauth: false
 
@@ -393,276 +854,356 @@ runcmd:
   - sed -i '/^search /c\search .' /etc/resolv.conf
   - echo "Netplan+DNS override applied" >> /var/log/cloud-init.log
 "@
-    Write-LogEntry -VMName $VMName -Message ("Built user-data payload, {0} bytes" -f $userData.Length)
 
-    $userDataEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($userData))
-    $metaData = "instance-id: $VMName`nlocal-hostname: $VMName"
-    $metaDataEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($metaData))
+  Write-LogEntry -VMName $VMName -Message ("Built user-data payload, {0} bytes" -f $userData.Length)
+  $userDataEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($userData))
+  $metaData = "instance-id: $VMName`nlocal-hostname: $VMName"
+  $metaDataEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($metaData))
 
-    # 4) Create VM
-    try {
-        $templateObj   = Get-Template     -Name $Template   -ErrorAction Stop
-        $folderObj     = Get-Folder       -Name $Folder     -ErrorAction Stop
-        $clusterObj    = Get-Cluster      -Name "vollminlab-ESXi-Cluster" -ErrorAction Stop
-        
-        # Check host readiness before creating VM and get available hosts
-        Test-VMHostReadiness -ClusterName "vollminlab-ESXi-Cluster" -VMName $VMName
-        
-        # Check template state
-        Write-LogEntry -VMName $VMName -Message ("Template '{0}' state: {1}" -f $Template, $templateObj.State)
-        
-        # Check datastore space
-        $datastores = Get-Datastore | Where-Object { $_.State -eq "Available" }
-        foreach ($ds in $datastores) {
-            $freeSpaceGB = [math]::Round($ds.FreeSpaceGB, 2)
-            Write-LogEntry -VMName $VMName -Message ("Datastore '{0}': {1}GB free" -f $ds.Name, $freeSpaceGB)
-        }
-        
-        # Get available hosts (not in maintenance mode) for explicit placement
-        $availableHosts = Get-VMHost -Location $clusterObj | Where-Object { $_.ConnectionState -eq "Connected" -and $_.State -ne "Maintenance" }
-        if ($availableHosts.Count -eq 0) {
-            throw "No available hosts found for VM deployment. All hosts are in maintenance mode or disconnected."
-        }
-        
-        # Select the first available host for explicit placement
-        $targetHost = $availableHosts | Select-Object -First 1
-        Write-LogEntry -VMName $VMName -Message ("Selected host '{0}' for VM deployment" -f $targetHost.Name)
-        
-        $poolObj       = Get-ResourcePool -Location $clusterObj | Where-Object Name -eq "Resources"
-        Write-LogEntry -VMName $VMName -Message ("Creating VM on host '{0}' with resource pool '{1}'" -f $targetHost.Name, $poolObj.Name)
-        $newVm         = New-VM           -Name $VMName -Template $templateObj -Location $folderObj -ResourcePool $poolObj -VMHost $targetHost -ErrorAction Stop
-        Write-LogEntry -VMName $VMName -Message "New-VM succeeded"
-    } catch {
-        Write-LogEntry -VMName $VMName -Message ("New-VM FAILED: {0}" -f $_)
-        throw
+  # 4) Create VM
+  try {
+    $templateObj   = Get-Template -Name $Template -ErrorAction Stop
+    $folderObj     = Get-Folder   -Name $Folder   -ErrorAction Stop
+    $clusterObj    = Get-Cluster  -Name $Script:ClusterName -ErrorAction Stop
+
+    Test-VMHostReadiness -ClusterName $Script:ClusterName -VMName $VMName | Out-Null
+
+    $datastores = Get-Datastore | Where-Object { $_.State -eq "Available" }
+    foreach ($ds in $datastores) {
+      $freeGB = [math]::Round($ds.FreeSpaceGB, 2)
+      Write-LogEntry -VMName $VMName -Message ("Datastore '{0}': {1}GB free" -f $ds.Name, $freeGB)
     }
 
-    # 5) Inject advanced settings
-    $settings = @(
-        @{ Name = "guestinfo.userdata";           Value = $userDataEncoded },
-        @{ Name = "guestinfo.userdata.encoding";  Value = "base64"       },
-        @{ Name = "guestinfo.metadata";           Value = $metaDataEncoded },
-        @{ Name = "guestinfo.metadata.encoding";  Value = "base64"       }
-    )
+    $availableHosts = Get-VMHost -Location $clusterObj | Where-Object { $_.ConnectionState -eq "Connected" -and $_.State -ne "Maintenance" }
+    if ($availableHosts.Count -eq 0) { throw "No available hosts found for VM deployment." }
+    $targetHost = $availableHosts | Select-Object -First 1
+    Write-LogEntry -VMName $VMName -Message ("Selected host '{0}' for deployment" -f $targetHost.Name)
 
-    foreach ($s in $settings) {
-        # Verbose-only “about to inject” message
-        Write-Verbose ("Injecting advanced setting '{0}' (value length: {1})" -f $s.Name, $s.Value.Length)
+    $poolObj = Get-ResourcePool -Location $clusterObj | Where-Object Name -eq "Resources"
+    $newVm   = New-VM -Name $VMName -Template $templateObj -Location $folderObj -ResourcePool $poolObj -VMHost $targetHost -ErrorAction Stop
+    Write-LogEntry -VMName $VMName -Message "New-VM succeeded"
+  } catch {
+    Write-LogEntry -VMName $VMName -Message ("New-VM FAILED: {0}" -f $_)
+    throw
+  }
 
-        # Do the actual injection
-        New-AdvancedSetting `
-            -Entity  $newVm `
-            -Name    $s.Name `
-            -Value   $s.Value `
-            -Confirm:$false `
-            -Force
+  # 5) Inject advanced settings
+  $settings = @(
+    @{ Name = "guestinfo.userdata";          Value = $userDataEncoded },
+    @{ Name = "guestinfo.userdata.encoding"; Value = "base64"         },
+    @{ Name = "guestinfo.metadata";          Value = $metaDataEncoded },
+    @{ Name = "guestinfo.metadata.encoding"; Value = "base64"         }
+  )
+  foreach ($s in $settings) {
+    New-AdvancedSetting -Entity $newVm -Name $s.Name -Value $s.Value -Confirm:$false -Force | Out-Null
+    Write-LogEntry -VMName $VMName -Message ("Injected advanced setting '{0}'" -f $s.Name)
+  }
 
-        # Single log entry in your file
-        Write-LogEntry -VMName $VMName -Message ("Injected advanced setting '{0}'" -f $s.Name)
+  # 6) Resource mods
+  if ($CPU -or $MemoryGB -or $DiskGB) {
+    if ($CPU) { 
+      Set-VM -VM $newVm -NumCpu $CPU -Confirm:$false | Out-Null
+      Write-LogEntry -VMName $VMName -Message "Set CPU cores to $CPU"
     }
-
-    Write-LogEntry -VMName $VMName -Message "Cloud-init data injected"
-
-    # 6) Modify VM resources if specified
-    if ($CPU -or $MemoryGB -or $DiskGB) {
-        Write-LogEntry -VMName $VMName -Message ("Modifying VM resources: CPU={0}, Memory={1}GB, Disk={2}GB" -f $CPU, $MemoryGB, $DiskGB)
-        
-        # Get current VM specs (not template specs, since VM was just created from template)
-        $currentMemory = $newVm.MemoryGB
-        $currentCPUs = $newVm.NumCpu
-        
-        # Modify CPU
-        if ($CPU -and $CPU -gt 0) {
-            if ($CPU -gt $currentCPUs) {
-                Write-LogEntry -VMName $VMName -Message ("Increasing CPU from {0} to {1}" -f $currentCPUs, $CPU)
-                Set-VM -VM $newVm -NumCpu $CPU -Confirm:$false
-            } elseif ($CPU -lt $currentCPUs) {
-                Write-LogEntry -VMName $VMName -Message ("Decreasing CPU from {0} to {1} (Warning: may impact performance)" -f $currentCPUs, $CPU)
-                Set-VM -VM $newVm -NumCpu $CPU -Confirm:$false
-            }
-        }
-        
-        # Modify Memory
-        if ($MemoryGB -and $MemoryGB -gt 0) {
-            if ($MemoryGB -gt $currentMemory) {
-                Write-LogEntry -VMName $VMName -Message ("Increasing Memory from {0}GB to {1}GB" -f $currentMemory, $MemoryGB)
-                Set-VM -VM $newVm -MemoryGB $MemoryGB -Confirm:$false
-            } elseif ($MemoryGB -lt $currentMemory) {
-                if ($MemoryGB -lt 2) {
-                    Write-LogEntry -VMName $VMName -Message ("WARNING: Memory {0}GB may be too low for proper operation" -f $MemoryGB)
-                }
-                Write-LogEntry -VMName $VMName -Message ("Decreasing Memory from {0}GB to {1}GB" -f $currentMemory, $MemoryGB)
-                Set-VM -VM $newVm -MemoryGB $MemoryGB -Confirm:$false
-            }
-        }
-        
-        # Modify Disk
-        if ($DiskGB -and $DiskGB -gt 0) {
-            $firstDisk = Get-HardDisk -VM $newVm | Select-Object -First 1
-            $currentDiskSize = [math]::Round($firstDisk.CapacityGB)
-            
-            if ($DiskGB -gt $currentDiskSize) {
-                Write-LogEntry -VMName $VMName -Message ("Expanding disk from {0}GB to {1}GB" -f $currentDiskSize, $DiskGB)
-                Set-HardDisk -HardDisk $firstDisk -CapacityGB $DiskGB -Confirm:$false
-            } elseif ($DiskGB -lt $currentDiskSize) {
-                Write-LogEntry -VMName $VMName -Message ("ERROR: Cannot shrink disk from {0}GB to {1}GB - VMware does not support disk shrinking" -f $currentDiskSize, $DiskGB)
-                Write-LogEntry -VMName $VMName -Message ("Skipping disk resize - keeping original size of {0}GB" -f $currentDiskSize)
-                # Don't attempt to shrink - VMware doesn't support it
-            }
-        }
-        
-        Write-LogEntry -VMName $VMName -Message "VM resource modification complete"
+    if ($MemoryGB) { 
+      Set-VM -VM $newVm -MemoryGB $MemoryGB -Confirm:$false | Out-Null
+      Write-LogEntry -VMName $VMName -Message "Set memory to ${MemoryGB}GB"
     }
-
-    # 7) Power on
-    if ($PowerOn) {
-        Start-VM -VM $newVm -Confirm:$false | Out-Null
-        Write-LogEntry -VMName $VMName -Message "VM powered on"
+    if ($DiskGB) {
+      $firstDisk = Get-HardDisk -VM $newVm | Select-Object -First 1
+      $cur = [math]::Round($firstDisk.CapacityGB)
+      if ($DiskGB -gt $cur) { 
+        Set-HardDisk -HardDisk $firstDisk -CapacityGB $DiskGB -Confirm:$false | Out-Null
+        Write-LogEntry -VMName $VMName -Message "Expanded disk to ${DiskGB}GB"
+      }
+      elseif ($DiskGB -lt $cur) { 
+        Write-LogEntry -VMName $VMName -Message ("Skip shrinking disk from {0}GB to {1}GB - VMware will not allow disk shrinking" -f $cur,$DiskGB) 
+      }
     }
+    Write-LogEntry -VMName $VMName -Message "VM resource modification complete"
+  }
 
-    Write-LogEntry -VMName $VMName -Message "Install-VirtualMachine COMPLETE"
+  # 7) Power on
+  if ($PowerOn) { Start-VM -VM $newVm -Confirm:$false | Out-Null; Write-LogEntry -VMName $VMName -Message "VM powered on" }
+
+  Write-LogEntry -VMName $VMName -Message "Install-VirtualMachine COMPLETE"
 }
 
+# ---------- Top-level orchestration ----------
 function Invoke-VMDeployment {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$VMName,
-        [Parameter(Mandatory)][string]$TemplateName,
-        [Parameter(Mandatory)][string]$IPAddress,
-        [Parameter(Mandatory)][string]$VMFolder,
-        [int]$CPU,
-        [int]$MemoryGB,
-        [int]$DiskGB,
-        [switch]$WhatIf,
-        [switch]$PowerOn
-    )
-    if ($PSBoundParameters.ContainsKey('Verbose')) { $Script:VerboseLogging = $true }
+  <#
+  .SYNOPSIS
+      Deploys a new VM with automated SSH key generation, DNS registration, and cloud-init configuration.
+  
+  .DESCRIPTION
+      Orchestrates the complete VM deployment process including:
+      - SSH key generation and storage in 1Password
+      - SSH config entry creation
+      - vCenter connection and VM creation from template
+      - DNS record registration in Pi-hole
+      - Random sudo password generation and storage
+      - Cloud-init configuration for automated OS setup
+  
+  .PARAMETER VMName
+      The name of the VM to create. Also used as the hostname.
+  
+  .PARAMETER TemplateName
+      The name of the vCenter template to clone.
+  
+  .PARAMETER IPAddress
+      The static IP address to assign to the VM.
+  
+  .PARAMETER VMFolder
+      The vCenter folder where the VM will be created.
+  
+  .PARAMETER CPU
+      Optional. Number of CPU cores to assign to the VM.
+  
+  .PARAMETER MemoryGB
+      Optional. Amount of memory in GB to assign to the VM.
+  
+  .PARAMETER DiskGB
+      Optional. Disk size in GB (can only increase from template size).
+  
+  .PARAMETER WhatIf
+      Shows what would happen without actually making changes.
+  
+  .PARAMETER PowerOn
+      If specified, powers on the VM after creation.
+  
+  .PARAMETER ClearOpAuthToken
+      If specified, clears the 1Password authentication token after deployment completes.
+  
+  .EXAMPLE
+      Invoke-VMDeployment -VMName "web01" -TemplateName "Ubuntu-22.04-Template" `
+                          -IPAddress "192.168.152.100" -VMFolder "WebServers" -PowerOn
+  
+  .EXAMPLE
+      Invoke-VMDeployment -VMName "db01" -TemplateName "Ubuntu-22.04-Template" `
+                          -IPAddress "192.168.152.101" -VMFolder "Database" `
+                          -CPU 8 -MemoryGB 16 -DiskGB 100 -PowerOn -ClearOpAuthToken
+  #>
+  [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Medium')]
+  param(
+    [Parameter(Mandatory)][string]$VMName,
+    [Parameter(Mandatory)][string]$TemplateName,
+    [Parameter(Mandatory)][string]$IPAddress,
+    [Parameter(Mandatory)][string]$VMFolder,
+    [int]$CPU,
+    [int]$MemoryGB,
+    [int]$DiskGB,
+    [switch]$PowerOn,
+    [switch]$ClearOpAuthToken
+  )
+  if ($PSBoundParameters.ContainsKey('Verbose')) { $Script:VerboseLogging = $true }
 
-    $dns = "$VMName.vollminlab.com"
-    if (-not $WhatIf) {
-        Write-LogEntry -VMName $VMName -Message ("Invoke-VMDeployment START Template={0},IP={1},Folder={2},PowerOn={3}" -f $TemplateName, $IPAddress, $VMFolder, $PowerOn)
-        Write-LogEntry -VMName $VMName -Message ("Checking DNS for {0}" -f "$VMName.vollminlab.com")
+  $fqdn = "$VMName.$($Script:Domain)"
+  
+  if (-not $PSCmdlet.ShouldProcess("VM: $VMName", "Deploy VM with IP $IPAddress")) {
+    return
+  }
+  
+  Write-LogEntry -VMName $VMName -Message ("Invoke-VMDeployment START Template={0},IP={1},Folder={2},PowerOn={3}" -f $TemplateName,$IPAddress,$VMFolder,$PowerOn)
+  Write-LogEntry -VMName $VMName -Message ("Checking DNS for {0}" -f $fqdn)
+  
+  # Check if DNS already exists
+  try { $existing = [System.Net.Dns]::GetHostAddresses($fqdn) | Select-Object -ExpandProperty IPAddressToString } catch { $existing = $null }
+  if ($existing) {
+    Write-LogEntry -VMName $VMName -Message ("DNS {0} resolves to {1}, aborting" -f $fqdn,$existing)
+    Write-Error ("DNS {0} already resolves to {1}, aborting" -f $fqdn, $existing)
+    return
+  }
+
+  # WhatIf mode - just describe what would happen (for explicit -WhatIf parameter)
+  if ($WhatIfPreference) {
+    Write-Host "[WhatIf] Would generate ed25519 SSH keypair for $VMName"
+    Write-Host "[WhatIf] Would store SSH key in 1Password vault '$($Script:VaultName)' as '${VMName}_id_ed25519'"
+    Write-Host "[WhatIf] Would save public key to ~/.ssh/${VMName}_id_ed25519.pub"
+    Write-Host "[WhatIf] Would add SSH config entry for host '$VMName' ($fqdn)"
+    if (-not $Script:IsGlados) {
+      Write-Host "[WhatIf] Would mirror SSH config to remote GLaDOS host"
     }
-    try { $existing = [System.Net.Dns]::GetHostAddresses($dns) | Select-Object -ExpandProperty IPAddressToString } catch { $existing = $null }
-    if ($existing) {
-        Write-LogEntry -VMName $VMName -Message ("DNS {0} resolves to {1}, aborting" -f $dns, $existing)
-        Write-Error ("DNS {0} already resolves to {1}, aborting" -f $dns, $existing)
-        return
-    }
-    Connect-ToVCenter    -WhatIf:$WhatIf
-    Add-DnsRecordToPiHole -Domain $dns -IPAddress $IPAddress -WhatIf:$WhatIf
-    New-SshKeyPair        -KeyPath "C:\.ssh\converted\$VMName`_id_rsa" -Passphrase ([ref]"") -WhatIf:$WhatIf
-    Add-SshConfigEntry    -HostName $VMName -DnsName $dns -KeyPath "C:\.ssh\converted\$VMName`_id_rsa" -WhatIf:$WhatIf
-    $pwRef = [ref]""
-    Install-VirtualMachine `
-        -VMName        $VMName `
-        -Template      $TemplateName `
-        -Folder        $VMFolder `
-        -IPAddress     $IPAddress `
-        -PublicKeyPath "C:\.ssh\converted\$VMName`_id_rsa.pub" `
-        -GuestPassword $pwRef `
-        -CPU           $CPU `
-        -MemoryGB      $MemoryGB `
-        -DiskGB        $DiskGB `
-        -WhatIf:$WhatIf `
-        -PowerOn:$PowerOn
-    if (-not $WhatIf) {
-        Write-LogEntry -VMName $VMName -Message "Invoke-VMDeployment COMPLETE"
-    }
+    Write-Host "[WhatIf] Would connect to vCenter using credentials from 1Password"
+    Write-Host "[WhatIf] Would add DNS record to Pi-hole"
+    Write-Host "[WhatIf] Would create VM from template '$TemplateName'"
+    return
+  }
+
+  # Create SSH key in 1Password (ed25519), save pub locally, no private key on disk
+  $key = New-1PSSHKeyForHost -HostName $VMName
+  # Local config entry
+  Add-SshConfigEntryLocal -HostName $VMName -DnsName $fqdn -PublicKeyPath $key.PublicKeyPathLocal
+
+  # If we're NOT on GLaDOS, try to copy pub + append host block remotely too
+  if (-not $Script:IsGlados) {
+    $ok = Update-RemoteGladosSsh -HostName $VMName -DnsName $fqdn `
+            -PublicKeyText $key.PublicKeyText `
+            -PublicKeyFileName ([IO.Path]::GetFileName($key.PublicKeyPathLocal))
+    if ($ok) { Write-LogEntry -VMName $VMName -Message "Mirrored SSH pub + config to GLaDOS" }
+    else     { Write-LogEntry -VMName $VMName -Message "Skipped/failed mirroring to GLaDOS (share inaccessible)" }
+  }
+
+  Connect-ToVCenter | Out-Null
+  Add-DnsRecordToPiHole -Fqdn $fqdn -IPAddress $IPAddress
+
+  # Reference variable to receive the generated sudo password from Install-VirtualMachine
+  $passwordRef = [ref]""
+  Install-VirtualMachine `
+    -VMName        $VMName `
+    -Template      $TemplateName `
+    -Folder        $VMFolder `
+    -IPAddress     $IPAddress `
+    -PublicKeyText $key.PublicKeyText `
+    -GuestPassword $passwordRef `
+    -CPU           $CPU `
+    -MemoryGB      $MemoryGB `
+    -DiskGB        $DiskGB `
+    -PowerOn:$PowerOn
+
+  Write-LogEntry -VMName $VMName -Message "Invoke-VMDeployment COMPLETE" 
+  if ($ClearOpAuthToken) {
+    Clear-OpAuth
+    Write-LogEntry -VMName $VMName -Message "Cleared 1Password authentication token"
+  }
 }
 
 function Remove-VMDeployment {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$VMName,
-        [switch]$WhatIf
-    )
+  <#
+  .SYNOPSIS
+      Removes a VM and cleans up all associated resources.
+  
+  .DESCRIPTION
+      Completely removes a VM deployment including:
+      - DNS record removal from Pi-hole
+      - Local and remote SSH config entries
+      - Local and remote SSH public key files
+      - Local and remote known_hosts entries
+      - Archives 1Password items for SSH key and sudo password
+      - Stops and removes VM from vCenter
+  
+  .PARAMETER VMName
+      The name of the VM to remove.
+  
+  .PARAMETER WhatIf
+      Shows what would be removed without actually making changes.
+  
+  .PARAMETER ClearOpAuthToken
+      If specified, clears the 1Password authentication token after removal completes.
+  
+  .EXAMPLE
+      Remove-VMDeployment -VMName "testvm"
+  
+  .EXAMPLE
+      Remove-VMDeployment -VMName "web01" -WhatIf
+  
+  .EXAMPLE
+      Remove-VMDeployment -VMName "prod01" -ClearOpAuthToken
+  #>
+  [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='High')]
+  param(
+    [Parameter(Mandatory)][string]$VMName,
+    [switch]$ClearOpAuthToken
+  )
 
-    if ($PSBoundParameters.ContainsKey('Verbose')) {
-        $Script:VerboseLogging = $true
+  if ($PSBoundParameters.ContainsKey('Verbose')) { $Script:VerboseLogging = $true }
+
+  $fqdn       = "$VMName.$($Script:Domain)"
+  $keyTitle   = "${VMName}_id_ed25519"
+  $localPub   = Join-Path (Join-Path $HOME '.ssh') ($keyTitle + '.pub')
+
+  if (-not $PSCmdlet.ShouldProcess("VM: $VMName", "Remove VM and all associated resources")) {
+    return
+  }
+
+  Write-LogEntry -VMName $VMName -Message "Remove-VMDeployment START"
+
+  # 1) DNS
+  Remove-DnsRecordFromPiHole -Fqdn $fqdn
+
+  # 2) Local SSH artifacts
+  if (Test-Path $localPub) {
+    Remove-Item -Path $localPub -Force
+    Write-LogEntry -VMName $VMName -Message "Removed local SSH public key $localPub"
+  }
+  $localConfig = Join-Path $HOME '.ssh\config'
+  if (Test-Path $localConfig) {
+    Remove-HostBlockFromConfig -HostName $VMName -ConfigPath $localConfig
+    Write-LogEntry -VMName $VMName -Message "Removed local SSH config entry for $VMName"
+  }
+  
+  # Remove from local known_hosts (hostname and FQDN)
+  $localKnownHosts = Join-Path $HOME '.ssh\known_hosts'
+  if (Test-Path $localKnownHosts) {
+    if (-not [string]::IsNullOrWhiteSpace($VMName)) {
+      Remove-HostFromKnownHosts -HostName $VMName -KnownHostsPath $localKnownHosts
     }
-
-    $domain     = "$VMName.vollminlab.com"
-    $sshKeyPath = "C:\.ssh\converted\$VMName`_id_rsa"
-    $sshConfig  = Join-Path $HOME '.ssh\config'
-    $knownHosts = Join-Path $HOME '.ssh\known_hosts'
-
-    if ($WhatIf) {
-        Write-Host "[WhatIf] Would remove DNS record for $domain"
-        Write-Host "[WhatIf] Would delete SSH key pair at $sshKeyPath and $sshKeyPath.pub"
-        Write-Host "[WhatIf] Would remove SSH config entry for host $VMName in $sshConfig"
-        Write-Host "[WhatIf] Would prune known_hosts entry for $domain in $knownHosts"
-        Write-Host "[WhatIf] Would delete 1Password item '$VMName' from vault 'homelab-vault'"
-        Write-Host "[WhatIf] Would connect to vCenter"
-        Write-Host "[WhatIf] Would power off and remove VM '$VMName' from vCenter"
-        return
+    if (-not [string]::IsNullOrWhiteSpace($fqdn)) {
+      Remove-HostFromKnownHosts -HostName $fqdn -KnownHostsPath $localKnownHosts
     }
+    Write-LogEntry -VMName $VMName -Message "Removed entries from local known_hosts"
+  }
 
-    Write-LogEntry -VMName $VMName -Message "Remove-VMDeployment START"
-
-    # 1) Delete Pi-hole record
-    Remove-DnsRecordFromPiHole -Domain $domain
-    Write-LogEntry -VMName $VMName -Message "Deleted Pi-hole A record for $domain"
-
-    # 2) Remove SSH keys
-    if (Test-Path $sshKeyPath) {
-        Remove-Item -Path $sshKeyPath -Force
-        Write-LogEntry -VMName $VMName -Message "Deleted SSH private key $sshKeyPath"
-    }
-    if (Test-Path "$sshKeyPath.pub") {
-        Remove-Item -Path "$sshKeyPath.pub" -Force
-        Write-LogEntry -VMName $VMName -Message "Deleted SSH public key $sshKeyPath.pub"
-    }
-
-    # 3) Remove SSH config block
-    if (Test-Path $sshConfig) {
-        $lines    = Get-Content $sshConfig
-        $filtered = @()
-        $skipping = $false
-
-        foreach ($line in $lines) {
-            if ($line -match "^Host\s+$VMName") {
-                $skipping = $true; continue
-            }
-            if ($skipping -and $line -match '^\s') {
-                continue
-            }
-            $skipping = $false
-            $filtered += $line
+  # 3) Remote GLaDOS mirrors (only if not on GLaDOS; safe to try from either)
+  try {
+    if (Test-Path $Script:RemoteUserProfileShare) {
+      $remotePub = Join-Path $Script:RemoteUserProfileShare ($keyTitle + '.pub')
+      if (Test-Path $remotePub) {
+        Remove-Item $remotePub -Force
+        Write-LogEntry -VMName $VMName -Message "Removed remote SSH public key $remotePub"
+      }
+      if (Test-Path $Script:RemoteConfigPath) {
+        Remove-HostBlockFromConfig -HostName $VMName -ConfigPath $Script:RemoteConfigPath
+        Write-LogEntry -VMName $VMName -Message "Removed remote SSH config entry for $VMName"
+      }
+      
+      # Remove from remote known_hosts
+      $remoteKnownHosts = Join-Path $Script:RemoteUserProfileShare 'known_hosts'
+      if (Test-Path $remoteKnownHosts) {
+        if (-not [string]::IsNullOrWhiteSpace($VMName)) {
+          Remove-HostFromKnownHosts -HostName $VMName -KnownHostsPath $remoteKnownHosts
         }
-
-        $filtered | Set-Content $sshConfig
-        Write-LogEntry -VMName $VMName -Message "Removed SSH config entry for host $VMName"
-    }
-
-    # 4) Prune known_hosts entry if present
-    if (Test-Path $knownHosts) {
-        $allLines = Get-Content $knownHosts
-        if ($allLines -match [regex]::Escape($domain)) {
-            # Only call ssh-keygen if an entry existed
-            ssh-keygen -R $domain -f $knownHosts 2>$null
-            Write-LogEntry -VMName $VMName -Message "Pruned known_hosts entry for $domain"
-        } else {
-            Write-LogEntry -VMName $VMName -Message "No known_hosts entry for $domain. Skipping"
+        if (-not [string]::IsNullOrWhiteSpace($fqdn)) {
+          Remove-HostFromKnownHosts -HostName $fqdn -KnownHostsPath $remoteKnownHosts
         }
+        Write-LogEntry -VMName $VMName -Message "Removed entries from remote known_hosts"
+      }
     }
+  } catch {
+    Write-LogEntry -VMName $VMName -Message "Remote cleanup skipped/failed: $_"
+  }
 
-    # 5) Delete from 1Password
-    Set-OpSession
-    op item delete $VMName --vault homelab-vault
-    Write-LogEntry -VMName $VMName -Message "Deleted 1Password item '$VMName'"
-
-    # 6) Remove VM in vCenter (power off then delete)
-    Connect-ToVCenter -WhatIf:$false
-    $vmObj = Get-VM -Name $VMName -ErrorAction SilentlyContinue
-    if ($vmObj) {
-        Stop-VM   -VM $vmObj -Confirm:$false -ErrorAction SilentlyContinue
-        Remove-VM -VM $vmObj -DeletePermanently -Confirm:$false
-        Write-LogEntry -VMName $VMName -Message "VM $VMName removed from vCenter"
-    } else {
-        Write-LogEntry -VMName $VMName -Message "VM $VMName not found in vCenter"
+  # 4) Archive SSH Key item and sudo password item
+  Initialize-OpAuth
+  try {
+    op item delete $keyTitle --vault $Script:VaultName --archive | Out-Null
+    Write-LogEntry -VMName $VMName -Message "Archived 1Password SSH Key '$keyTitle'"
+    
+    # Archive sudo password item too
+    try {
+      op item delete $VMName --vault $Script:VaultName --archive | Out-Null
+      Write-LogEntry -VMName $VMName -Message "Archived 1Password sudo credential '$VMName'"
+    } catch {
+      Write-LogEntry -VMName $VMName -Message "WARN: Failed to archive sudo credential '$VMName' in 1Password: $_"
     }
+  } catch {
+    Write-LogEntry -VMName $VMName -Message "WARN: Failed to archive '$keyTitle' in 1Password: $_"
+  }
 
-    Write-LogEntry -VMName $VMName -Message "Remove-VMDeployment COMPLETE"
+  # 5) Remove VM
+  Connect-ToVCenter | Out-Null
+  $vmObj = Get-VM -Name $VMName -ErrorAction SilentlyContinue
+  if ($vmObj) {
+    Stop-VM -VM $vmObj -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    Remove-VM -VM $vmObj -DeletePermanently -Confirm:$false | Out-Null
+    Write-LogEntry -VMName $VMName -Message "VM $VMName removed from vCenter"
+  } else {
+    Write-LogEntry -VMName $VMName -Message "VM $VMName not found in vCenter"
+  }
+
+  Write-LogEntry -VMName $VMName -Message "Remove-VMDeployment COMPLETE"
+  
+  if ($ClearOpAuthToken) {
+    Clear-OpAuth
+    Write-LogEntry -VMName $VMName -Message "Cleared 1Password authentication token"
+  }
 }
-
