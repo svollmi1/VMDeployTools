@@ -37,7 +37,6 @@
 # =========================
 
 # ---------- Settings ----------
-$Script:VerboseLogging          = $false
 $Script:VaultName               = 'Homelab'
 $Script:SvcTokenItemTitle       = 'VMDeploy-SSHKeyBroker Token'
 $Script:VCenterCredItemTitle    = 'vCenter local user SSO'
@@ -63,7 +62,7 @@ function Write-LogEntry {
   
   .DESCRIPTION
       Appends a timestamped message to a log file in the .\logs directory.
-      If verbose logging is enabled, also outputs to the console.
+      Outputs to console only when -Verbose is used, or for important milestone messages.
   
   .PARAMETER VMName
       The VM name, used to determine the log file name.
@@ -71,12 +70,16 @@ function Write-LogEntry {
   .PARAMETER Message
       The message to log.
   
+  .PARAMETER AlwaysShow
+      If specified, always show on console regardless of verbose setting.
+  
   .EXAMPLE
-      Write-LogEntry -VMName "web01" -Message "Deployment started"
+      Write-LogEntry -VMName "web01" -Message "Deployment started" -AlwaysShow
   #>
   param(
     [Parameter(Mandatory)][string]$VMName,
-    [Parameter(Mandatory)][string]$Message
+    [Parameter(Mandatory)][string]$Message,
+    [switch]$AlwaysShow
   )
   $logDir = ".\logs"
   if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
@@ -84,7 +87,11 @@ function Write-LogEntry {
   $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
   $line = ("[{0}] {1}" -f $timestamp, $Message)
   Add-Content -Path $logFile -Value $line
-  if ($Script:VerboseLogging) { Write-Host $line }
+  
+  # Show on console if verbose mode OR if this is a milestone message
+  if ($AlwaysShow -or $VerbosePreference -eq 'Continue') {
+    Write-Host $line
+  }
 }
 
 # ---------- 1Password Authentication ----------
@@ -761,6 +768,76 @@ function Remove-HostFromKnownHosts {
   $out | Set-Content $KnownHostsPath -Encoding UTF8
 }
 
+# ---------- Network Port Group Detection ----------
+function Get-NetworkPortGroupFromIP {
+  <#
+  .SYNOPSIS
+      Automatically determines the correct network port group based on IP address.
+  
+  .DESCRIPTION
+      Maps IP address subnets to their corresponding port groups by querying
+      vCenter for available port groups and matching the naming pattern.
+      Supports auto-discovery of new port groups following the XXX-DPG-* pattern.
+  
+  .PARAMETER IPAddress
+      The IP address to determine the port group for.
+  
+  .EXAMPLE
+      $portGroup = Get-NetworkPortGroupFromIP -IPAddress "192.168.152.100"
+  #>
+  param([Parameter(Mandatory)][string]$IPAddress)
+  
+  $ipParts = $IPAddress.Split('.')
+  $subnet = "$($ipParts[0]).$($ipParts[1]).$($ipParts[2])"
+  $subnetNumber = $ipParts[2]
+  
+  Write-Verbose "Determining port group for IP $IPAddress (subnet $subnet, number $subnetNumber)"
+  
+  # Get all port groups and find one that matches our subnet pattern
+  # Try distributed port groups first, then fall back to standard if needed
+  $allPortGroups = @()
+  try {
+    # Import VDS module if available for distributed port groups
+    if (Get-Module -ListAvailable -Name VMware.VimAutomation.Vds) {
+      Import-Module VMware.VimAutomation.Vds -ErrorAction SilentlyContinue
+      $allPortGroups = Get-VDPortgroup | Where-Object { $_.Name -match '^\d{3}-DPG-' }
+      Write-Verbose "Found $($allPortGroups.Count) distributed port groups matching pattern"
+    }
+  } catch {
+    Write-Verbose "VDS module not available, falling back to standard port groups"
+  }
+  
+  # Fallback to standard port groups if no distributed ones found
+  if ($allPortGroups.Count -eq 0) {
+    $allPortGroups = Get-VirtualPortGroup | Where-Object { $_.Name -match '^\d{3}-DPG-' }
+    Write-Verbose "Found $($allPortGroups.Count) standard port groups matching pattern"
+  }
+  
+  Write-Verbose "Found $($allPortGroups.Count) port groups matching pattern: $($allPortGroups.Name -join ', ')"
+  
+  # Look for a port group that starts with the subnet number
+  $matchingPG = $allPortGroups | Where-Object { $_.Name -match "^$subnetNumber-DPG-" } | Select-Object -First 1
+  
+  if ($matchingPG) {
+    Write-Verbose "Auto-detected port group '$($matchingPG.Name)' for subnet $subnet"
+    return $matchingPG.Name
+  }
+  
+  # Fallback to hardcoded mapping for known networks
+  Write-Verbose "No auto-detected port group found, using fallback mapping"
+  switch ($subnet) {
+    "192.168.152" { 
+      Write-Verbose "Using hardcoded mapping: 192.168.152 -> 152-DPG-GuestNet"
+      return "152-DPG-GuestNet" 
+    }
+    "192.168.160" { 
+      Write-Verbose "Using hardcoded mapping: 192.168.160 -> 160-DPG-DMZ"
+      return "160-DPG-DMZ" 
+    }
+    default { throw "No port group found for IP $IPAddress (subnet $subnet)" }
+  }
+}
+
 # ---------- Cloud-init VM build ----------
 function Install-VirtualMachine {
   <#
@@ -772,6 +849,7 @@ function Install-VirtualMachine {
       - Cloning from template
       - Injecting cloud-init user-data and metadata via guestinfo
       - Configuring CPU, memory, and disk resources
+      - Setting network adapter to correct port group based on IP
       - Optionally powering on the VM
       Generates and stores a random sudo password in 1Password.
   
@@ -838,6 +916,10 @@ function Install-VirtualMachine {
   Save-SudoPasswordTo1Password -VMName $VMName -SecurePassword (ConvertTo-SecureString $guestPw -AsPlainText -Force)
 
   # 3) cloud-init
+  # Calculate gateway from IP address (assume .1 is the gateway)
+  $ipParts = $IPAddress.Split('.')
+  $gateway = "{0}.{1}.{2}.1" -f $ipParts[0], $ipParts[1], $ipParts[2]
+  
   $hashedPw  = ConvertTo-SHA512Crypt -Password (ConvertTo-SecureString $guestPw -AsPlainText -Force)
   $userData = @"
 #cloud-config
@@ -871,7 +953,9 @@ write_files:
       network:
         version: 2
         ethernets:
-          ens33:
+          id0:
+            match:
+              name: "en*"
             addresses:
               - $IPAddress/24
             nameservers:
@@ -880,7 +964,7 @@ write_files:
                 - 192.168.100.3
             routes:
               - to: default
-                via: 192.168.152.1
+                via: $gateway
 
 runcmd:
   - netplan apply
@@ -954,7 +1038,7 @@ runcmd:
 
     $poolObj = Get-ResourcePool -Location $clusterObj | Where-Object Name -eq "Resources"
     $newVm   = New-VM -Name $VMName -Template $templateObj -Location $folderObj -ResourcePool $poolObj -VMHost $targetHost -Datastore $preferredDs -ErrorAction Stop
-    Write-LogEntry -VMName $VMName -Message "New-VM succeeded"
+    Write-LogEntry -VMName $VMName -Message "New-VM succeeded" -AlwaysShow
   } catch {
     Write-LogEntry -VMName $VMName -Message ("New-VM FAILED: {0}" -f $_)
     throw
@@ -972,7 +1056,18 @@ runcmd:
     Write-LogEntry -VMName $VMName -Message ("Injected advanced setting '{0}'" -f $s.Name)
   }
 
-  # 6) Resource mods
+  # 6) Configure network adapter to correct port group based on IP
+  try {
+    $portGroupName = Get-NetworkPortGroupFromIP -IPAddress $IPAddress
+    $network = Get-VirtualPortGroup -Name $portGroupName
+    $vmNetworkAdapter = Get-NetworkAdapter -VM $newVm
+    Set-NetworkAdapter -NetworkAdapter $vmNetworkAdapter -Portgroup $network -Confirm:$false | Out-Null
+    Write-LogEntry -VMName $VMName -Message "Set network adapter to port group '$portGroupName'"
+  } catch {
+    Write-LogEntry -VMName $VMName -Message "WARN: Failed to set network port group: $_"
+  }
+
+  # 7) Resource mods
   if ($CPU -or $MemoryGB -or $DiskGB) {
     if ($CPU) { 
       Set-VM -VM $newVm -NumCpu $CPU -Confirm:$false | Out-Null
@@ -996,8 +1091,8 @@ runcmd:
     Write-LogEntry -VMName $VMName -Message "VM resource modification complete"
   }
 
-  # 7) Power on
-  if ($PowerOn) { Start-VM -VM $newVm -Confirm:$false | Out-Null; Write-LogEntry -VMName $VMName -Message "VM powered on" }
+  # 8) Power on
+  if ($PowerOn) { Start-VM -VM $newVm -Confirm:$false | Out-Null; Write-LogEntry -VMName $VMName -Message "VM powered on" -AlwaysShow }
 
   Write-LogEntry -VMName $VMName -Message "Install-VirtualMachine COMPLETE"
 }
@@ -1055,6 +1150,10 @@ function Invoke-VMDeployment {
       Invoke-VMDeployment -VMName "db01" -TemplateName "Ubuntu-22.04-Template" `
                           -IPAddress "192.168.152.101" -VMFolder "Database" `
                           -CPU 8 -MemoryGB 16 -DiskGB 100 -PowerOn -ClearOpAuthToken
+  
+  .EXAMPLE
+      Invoke-VMDeployment -VMName "dmz01" -TemplateName "Ubuntu-22.04-Template" `
+                          -IPAddress "192.168.160.10" -VMFolder "DMZ" -PowerOn
   #>
   [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Medium')]
   param(
@@ -1068,15 +1167,14 @@ function Invoke-VMDeployment {
     [switch]$PowerOn,
     [switch]$ClearOpAuthToken
   )
-  if ($PSBoundParameters.ContainsKey('Verbose')) { $Script:VerboseLogging = $true }
-
+  
   $fqdn = "$VMName.$($Script:Domain)"
   
   if (-not $PSCmdlet.ShouldProcess("VM: $VMName", "Deploy VM with IP $IPAddress")) {
     return
   }
   
-  Write-LogEntry -VMName $VMName -Message ("Invoke-VMDeployment START Template={0},IP={1},Folder={2},PowerOn={3}" -f $TemplateName,$IPAddress,$VMFolder,$PowerOn)
+  Write-LogEntry -VMName $VMName -Message ("Invoke-VMDeployment START Template={0},IP={1},Folder={2},PowerOn={3}" -f $TemplateName,$IPAddress,$VMFolder,$PowerOn) -AlwaysShow
   Write-LogEntry -VMName $VMName -Message ("Checking DNS for {0}" -f $fqdn)
   
   # Check if DNS already exists
@@ -1122,18 +1220,18 @@ function Invoke-VMDeployment {
   # Reference variable to receive the generated sudo password from Install-VirtualMachine
   $passwordRef = [ref]""
   Install-VirtualMachine `
-    -VMName        $VMName `
-    -Template      $TemplateName `
-    -Folder        $VMFolder `
-    -IPAddress     $IPAddress `
-    -PublicKeyText $key.PublicKeyText `
-    -GuestPassword $passwordRef `
-    -CPU           $CPU `
-    -MemoryGB      $MemoryGB `
-    -DiskGB        $DiskGB `
+    -VMName           $VMName `
+    -Template         $TemplateName `
+    -Folder           $VMFolder `
+    -IPAddress        $IPAddress `
+    -PublicKeyText    $key.PublicKeyText `
+    -GuestPassword    $passwordRef `
+    -CPU              $CPU `
+    -MemoryGB         $MemoryGB `
+    -DiskGB           $DiskGB `
     -PowerOn:$PowerOn
 
-  Write-LogEntry -VMName $VMName -Message "Invoke-VMDeployment COMPLETE" 
+  Write-LogEntry -VMName $VMName -Message "Invoke-VMDeployment COMPLETE" -AlwaysShow 
   if ($ClearOpAuthToken) {
     Clear-OpAuth
     Write-LogEntry -VMName $VMName -Message "Cleared 1Password authentication token"
@@ -1178,8 +1276,6 @@ function Remove-VMDeployment {
     [switch]$ClearOpAuthToken
   )
 
-  if ($PSBoundParameters.ContainsKey('Verbose')) { $Script:VerboseLogging = $true }
-
   $fqdn       = "$VMName.$($Script:Domain)"
   $keyTitle   = "${VMName}_id_ed25519"
   $localPub   = Join-Path (Join-Path $HOME '.ssh') ($keyTitle + '.pub')
@@ -1188,7 +1284,7 @@ function Remove-VMDeployment {
     return
   }
 
-  Write-LogEntry -VMName $VMName -Message "Remove-VMDeployment START"
+  Write-LogEntry -VMName $VMName -Message "Remove-VMDeployment START" -AlwaysShow
 
   # 1) DNS
   Remove-DnsRecordFromPiHole -Fqdn $fqdn
@@ -1268,12 +1364,12 @@ function Remove-VMDeployment {
   if ($vmObj) {
     Stop-VM -VM $vmObj -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
     Remove-VM -VM $vmObj -DeletePermanently -Confirm:$false | Out-Null
-    Write-LogEntry -VMName $VMName -Message "VM $VMName removed from vCenter"
+    Write-LogEntry -VMName $VMName -Message "VM $VMName removed from vCenter" -AlwaysShow
   } else {
     Write-LogEntry -VMName $VMName -Message "VM $VMName not found in vCenter"
   }
 
-  Write-LogEntry -VMName $VMName -Message "Remove-VMDeployment COMPLETE"
+  Write-LogEntry -VMName $VMName -Message "Remove-VMDeployment COMPLETE" -AlwaysShow
   
   if ($ClearOpAuthToken) {
     Clear-OpAuth
