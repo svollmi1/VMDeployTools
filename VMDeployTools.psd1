@@ -8,7 +8,6 @@
     Description       = 'Automates VM deployments, sets DNS records in Pi-hole, generates SSH keys, manages cloud-init and logging.'
     PowerShellVersion = '5.1'
 
-    RequiredModules   = @('VMware.PowerCLI')
     RequiredAssemblies = @()
 
     FunctionsToExport = @(
