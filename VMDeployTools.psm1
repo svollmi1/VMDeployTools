@@ -54,6 +54,7 @@ $Script:ClusterName             = $Script:Config.ClusterName
 $Script:Domain                  = $Script:Config.Domain
 $Script:VCenterServer           = $Script:Config.VCenterServer
 $Script:PiHoleServer            = $Script:Config.PiHoleServer
+$Script:PiHoleServerFallback    = $Script:Config.PiHoleServerFallback
 $Script:PiHolePort              = $Script:Config.PiHolePort
 $Script:PreferredDatastores     = $Script:Config.PreferredDatastores  # Shared storage preferred over local
 
@@ -257,6 +258,40 @@ function ConvertTo-SHA512Crypt {
 }
 
 # ---------- DNS (Pi-hole) ----------
+function Invoke-PiHoleRequest {
+  # Private helper: tries the primary Pi-hole server, falls back to the secondary on
+  # connection failures (unreachable host). HTTP API errors are re-thrown immediately
+  # without attempting the fallback, since both servers should return the same response.
+  param(
+    [Parameter(Mandatory)][string]$Endpoint,
+    [Parameter(Mandatory)][string]$Method,
+    [Parameter(Mandatory)][hashtable]$Headers,
+    [string]$Body
+  )
+
+  $servers = @($Script:PiHoleServer)
+  if (-not [string]::IsNullOrWhiteSpace($Script:PiHoleServerFallback)) {
+    $servers += $Script:PiHoleServerFallback
+  }
+
+  $lastError = $null
+  foreach ($server in $servers) {
+    $url = "http://${server}:$($Script:PiHolePort)/$Endpoint"
+    try {
+      $params = @{ Uri = $url; Method = $Method; Headers = $Headers }
+      if ($Body) { $params.Body = $Body }
+      return Invoke-RestMethod @params
+    }
+    catch {
+      # Got an HTTP response — API error, no point trying the fallback
+      if ($_.Exception.Response) { throw }
+      # No response — connection failure, try next server
+      $lastError = $_
+    }
+  }
+  throw $lastError
+}
+
 function Get-PiHoleApiToken {
   <#
   .SYNOPSIS
@@ -311,20 +346,18 @@ function Add-DnsRecordToPiHole {
   
   $vm = $Fqdn.Split('.')[0]
   
-  $url   = "http://$($Script:PiHoleServer):$($Script:PiHolePort)/add-a-record"
-  $token = Get-PiHoleApiToken
-  $hdr   = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
-  $body  = @{ domain = $Fqdn; ip = $IPAddress } | ConvertTo-Json
-  try { 
-    $response = Invoke-RestMethod -Uri $url -Method Post -Headers $hdr -Body $body
-    # Check if record already exists
+  $token    = Get-PiHoleApiToken
+  $hdr      = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
+  $body     = @{ domain = $Fqdn; ip = $IPAddress } | ConvertTo-Json
+  try {
+    $response = Invoke-PiHoleRequest -Endpoint "add-a-record" -Method Post -Headers $hdr -Body $body
     if ($response.message -match "already exists") {
       Write-LogEntry -VMName $vm -Message "Pi-hole A record already exists for $Fqdn"
     } else {
       Write-LogEntry -VMName $vm -Message "Added Pi-hole A record for $Fqdn -> $IPAddress"
     }
   }
-  catch { 
+  catch {
     $status = if ($_.Exception.Response) { $_.Exception.Response.StatusCode } else { "Unknown" }
     Write-LogEntry -VMName $vm -Message ("Failed to add Pi-hole A record: Status=$status, Error=$_")
   }
@@ -354,15 +387,14 @@ function Remove-DnsRecordFromPiHole {
   
   $vm = $Fqdn.Split('.')[0]
   
-  $url   = "http://$($Script:PiHoleServer):$($Script:PiHolePort)/delete-a-record"
-  $token = Get-PiHoleApiToken
-  $hdr   = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
-  $body  = @{ domain = $Fqdn } | ConvertTo-Json
-  try { 
-    Invoke-RestMethod -Uri $url -Method Delete -Headers $hdr -Body $body | Out-Null
-    Write-LogEntry -VMName $vm -Message "Deleted Pi-hole A record for $Fqdn" 
+  $token    = Get-PiHoleApiToken
+  $hdr      = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
+  $body     = @{ domain = $Fqdn } | ConvertTo-Json
+  try {
+    Invoke-PiHoleRequest -Endpoint "delete-a-record" -Method Delete -Headers $hdr -Body $body | Out-Null
+    Write-LogEntry -VMName $vm -Message "Deleted Pi-hole A record for $Fqdn"
   }
-  catch { 
+  catch {
     $status = if ($_.Exception.Response) { $_.Exception.Response.StatusCode } else { "Unknown" }
     Write-LogEntry -VMName $vm -Message ("Failed to delete Pi-hole A record: Status=$status, Error=$_")
   }
