@@ -3,3 +3,6 @@ VMDeployTools.config.psd1
 
 # Deployment logs
 logs/
+
+# Claude Code local config
+.claude/
