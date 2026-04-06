@@ -1,74 +1,74 @@
 # VMDeployTools
 
-PowerShell module for automated VM deployment in VMware vSphere with integrated 1Password SSH key management, DNS automation, and cloud-init configuration.
+PowerShell module for automated VM deployment in VMware vSphere with integrated 1Password SSH key management, Pi-hole DNS automation, and cloud-init configuration.
 
 ## Features
 
-- **Automated VM Deployment**: Clone VMs from templates with customizable CPU, memory, and disk
-- **1Password Integration**: 
-  - SSH key generation and secure storage using 1Password SSH agent
-  - Service account token management with lazy authentication
-  - Automatic credential retrieval for vCenter and Pi-hole
-- **DNS Management**: Automatic A record creation/removal in Pi-hole
-- **Cloud-init Support**: Automated OS configuration with user accounts and SSH keys
-- **Complete Cleanup**: Removes all traces including SSH configs, known_hosts, and 1Password items
-- **Professional Logging**: Timestamped logs for each VM deployment
-- **PowerShell Best Practices**: Full `-WhatIf` and `-Confirm` support
+- **Zero-touch setup**: Config auto-bootstraps from a 1Password secure note on first import
+- **Automated VM deployment**: Clone VMs from templates with customizable CPU, memory, and disk
+- **Prereq validation**: Verifies template, folder, and cluster exist in vCenter before any side effects
+- **1Password integration**: SSH key generation, vCenter credentials, sudo passwords - all in the vault
+- **DNS management**: Automatic A record creation/removal via Pi-hole API (VRRP VIP aware)
+- **SSH config sync**: Host blocks written to `~/.ssh/config` and the `homelab-infrastructure` repo simultaneously, with auto-commit and push
+- **Infrastructure repo auto-discovery**: Finds the sibling `homelab-infrastructure` repo by matching GitHub owner - no hardcoded paths
+- **Cloud-init support**: Automated OS configuration including user accounts, SSH keys, and static networking
+- **Complete teardown**: `Remove-VMDeployment` removes DNS, SSH config, known_hosts, 1Password items, and the VM
+- **Idempotent retries**: SSH key creation reuses existing 1Password items; DNS and SSH config skip if already present
 
 ## Requirements
 
-- Windows PowerShell 5.1 or PowerShell 7+
-- [VMware PowerCLI](https://developer.vmware.com/powercli) module
-- [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) installed and configured
+- Windows PowerShell 5.1+
+- [VMware PowerCLI](https://developer.vmware.com/powercli) (auto-installed if missing)
+- [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) in PATH
 - 1Password SSH agent running
-- Access to:
-  - VMware vCenter
-  - Pi-hole API (for DNS management)
-  - 1Password vault with appropriate service account
+- Access to VMware vCenter and Pi-hole API
 
 ## Installation
 
-1. Clone this repository:
-   ```powershell
-   git clone https://github.com/VollminLab/VMDeployTools.git
-   cd VMDeployTools
-   ```
+```powershell
+git clone https://github.com/svollmi1/VMDeployTools
+git clone https://github.com/svollmi1/homelab-infrastructure  # sibling repo, same parent dir
+```
 
-2. Create your local configuration file:
-   ```powershell
-   Copy-Item VMDeployTools.config.example.psd1 VMDeployTools.config.psd1
-   ```
-   Then open `VMDeployTools.config.psd1` and fill in your values (see [Configuration](#configuration) below).
+Import the module. On first import, if `VMDeployTools.config.psd1` does not exist it is
+automatically created from the `VMDeployTools Config` secure note in 1Password:
 
-3. Import the module:
-   ```powershell
-   Import-Module .\VMDeployTools.psd1
-   ```
+```powershell
+Import-Module .\VMDeployTools\VMDeployTools.psd1
+```
 
-4. (Optional) Set the service account token permanently to avoid authentication prompts:
-   ```powershell
-   $token = op item get "<SvcTokenItemTitle>" --vault "<VaultName>" --field password --reveal
-   [Environment]::SetEnvironmentVariable('OP_SERVICE_ACCOUNT_TOKEN', $token, 'User')
-   ```
+That's it. No manual config file editing required on a fresh machine.
+
+### Manual config (fallback)
+
+If you need to set up without 1Password access, copy the example and fill in your values:
+
+```powershell
+Copy-Item VMDeployTools.config.example.psd1 VMDeployTools.config.psd1
+# Edit VMDeployTools.config.psd1
+```
+
+`VMDeployTools.config.psd1` is gitignored and never committed.
 
 ## Configuration
-
-Copy `VMDeployTools.config.example.psd1` to `VMDeployTools.config.psd1` and fill in your values.
-This file is gitignored and will never be committed.
 
 | Key | Description |
 |-----|-------------|
 | `VaultName` | 1Password vault name |
 | `SvcTokenItemTitle` | 1Password item holding the service account token (field: `password`) |
 | `VCenterCredItemTitle` | 1Password item holding vCenter credentials (fields: `username` / `password`) |
-| `LocalMachineName` | Hostname of the machine running this module (used for SSH mirroring logic) |
-| `RemoteUserProfileShare` | UNC path to the `.ssh` directory on a secondary machine to mirror SSH config/keys to |
+| `LocalMachineName` | Hostname of this machine - controls whether SSH config is mirrored to the remote share |
+| `RemoteUserProfileShare` | UNC path to `.ssh` on a secondary admin machine for SSH config mirroring |
 | `VCenterServer` | vCenter hostname or IP |
 | `ClusterName` | VMware cluster name |
-| `PreferredDatastores` | Shared datastore names (preferred over local datastores for VM placement) |
-| `Domain` | Internal DNS domain appended to VM names |
-| `PiHoleServer` | Pi-hole hostname or IP |
-| `PiHolePort` | Pi-hole API port |
+| `PreferredDatastores` | Shared datastore names preferred over local datastores for VM placement |
+| `Domain` | Internal DNS domain appended to VM names (e.g. `vollminlab.com`) |
+| `PiHoleServer` | Pi-hole API endpoint - use the VRRP/keepalived VIP if running HA Pi-hole |
+| `PiHolePort` | Pi-hole Flask API port |
+
+> **Note on `SshConfigRepoPath`**: This is no longer a config value. At module load time,
+> `Find-SiblingRepo` automatically locates `homelab-infrastructure` by matching the GitHub
+> owner from this repo's own remote URL. Both repos must be cloned in the same parent directory.
 
 ## Quick Start
 
@@ -76,25 +76,23 @@ This file is gitignored and will never be committed.
 
 ```powershell
 Invoke-VMDeployment -VMName "webserver01" `
-                    -TemplateName "ubuntu-template" `
-                    -IPAddress "10.0.0.100" `
-                    -VMFolder "Production" `
-                    -CPU 4 `
-                    -MemoryGB 8 `
-                    -DiskGB 50 `
+                    -TemplateName "Ubuntu-24.04-Template" `
+                    -IPAddress "192.168.152.100" `
+                    -VMFolder "Linux VMs" `
+                    -CPU 4 -MemoryGB 8 -DiskGB 50 `
                     -PowerOn
 ```
 
-This will:
-1. Generate an ed25519 SSH keypair in 1Password
-2. Save the public key locally to `~/.ssh/webserver01_id_ed25519.pub`
-3. Add SSH config entries (local and remote)
-4. Connect to vCenter using credentials from 1Password
-5. Create a DNS A record in Pi-hole
-6. Clone VM from template with cloud-init configuration
-7. Generate and store a random sudo password in 1Password
-8. Configure CPU, memory, and disk resources
-9. Power on the VM
+What happens in order:
+
+1. DNS conflict check (aborts if FQDN already resolves)
+2. vCenter prereq validation - confirms template, folder, and cluster exist before touching anything
+3. SSH keypair generated in 1Password (reuses existing key if present)
+4. SSH config entry written to `~/.ssh/config` and the `homelab-infrastructure` repo; repo auto-committed and pushed
+5. DNS A record added to Pi-hole
+6. VM cloned from template with cloud-init payload (hostname, user, SSH key, static IP, sudo password)
+7. CPU / memory / disk resized if specified
+8. VM powered on
 
 ### Remove a VM
 
@@ -102,208 +100,165 @@ This will:
 Remove-VMDeployment -VMName "webserver01"
 ```
 
-This will:
-1. Remove DNS A record from Pi-hole
-2. Remove local SSH public key, config entry, and known_hosts entries
-3. Remove remote SSH public key, config entry, and known_hosts entries
-4. Archive (not delete) SSH key and sudo password in 1Password
-5. Stop and remove VM from vCenter
+What happens:
 
-### Preview Changes with -WhatIf
+1. DNS A record removed from Pi-hole
+2. SSH public key, config entry, and known_hosts entries removed locally
+3. Same cleanup on the remote SSH share (if accessible)
+4. SSH config entry removed from `homelab-infrastructure` repo; repo auto-committed and pushed
+5. SSH key and sudo password archived (not deleted) in 1Password
+6. VM stopped and permanently removed from vCenter
 
-```powershell
-Invoke-VMDeployment "testvm" -TemplateName "ubuntu-template" `
-    -IPAddress "10.0.0.100" -VMFolder "Lab" `
-    -CPU 2 -MemoryGB 4 -DiskGB 30 -PowerOn -WhatIf
-
-Remove-VMDeployment "testvm" -WhatIf
-```
-
-### Security: Clear Auth Token After Operations
+### Preview with -WhatIf
 
 ```powershell
-Invoke-VMDeployment "prodvm" -TemplateName "ubuntu-template" `
-    -IPAddress "10.0.0.100" -VMFolder "Production" `
-    -CPU 4 -MemoryGB 8 -DiskGB 50 -PowerOn -ClearOpAuthToken
+Invoke-VMDeployment -VMName "testvm" -TemplateName "Ubuntu-24.04-Template" `
+    -IPAddress "192.168.152.100" -VMFolder "Linux VMs" -PowerOn -WhatIf
+
+Remove-VMDeployment -VMName "testvm" -WhatIf
 ```
+
+### Clear auth token after sensitive operations
+
+```powershell
+Invoke-VMDeployment -VMName "prodvm" -TemplateName "Ubuntu-24.04-Template" `
+    -IPAddress "192.168.152.100" -VMFolder "Production" -PowerOn -ClearOpAuthToken
+```
+
+## Disaster Recovery
+
+Full rebuild on a new machine:
+
+```powershell
+# 1. Install prerequisites: 1Password CLI, 1Password desktop (SSH agent)
+# 2. Clone repos into the same parent directory
+git clone https://github.com/svollmi1/VMDeployTools
+git clone https://github.com/svollmi1/homelab-infrastructure
+
+# 3. Import - config bootstraps from 1Password, infra repo is auto-discovered
+Import-Module .\VMDeployTools\VMDeployTools.psd1
+
+# 4. Copy SSH public keys from the infra repo to ~/.ssh/
+Copy-Item homelab-infrastructure\hosts\windows\ssh\*.pub ~\.ssh\
+
+# 5. Copy the SSH config
+Copy-Item homelab-infrastructure\hosts\windows\ssh\config ~\.ssh\config
+```
+
+The `VMDeployTools Config` secure note in 1Password is the source of truth for all config values.
+Update that note when infrastructure changes (e.g. new vCenter, new Pi-hole VIP).
 
 ## Authentication
 
-The module uses **lazy authentication** - it only authenticates to 1Password when you first use a function that needs it (not at module import).
+The module uses lazy authentication - 1Password is only contacted when first needed, not at import.
 
-1. **First operation**: You'll get one 1Password authentication prompt
-2. **Subsequent operations**: The service account token persists for the session
-3. **New session**: Re-authenticate once
+- **Config bootstrap** (import time, one-time): Uses personal 1Password auth (biometric/desktop) to read the config note and write `VMDeployTools.config.psd1`
+- **Runtime operations**: Use the service account token stored in the vault, fetched once per session and held in `$env:OP_SERVICE_ACCOUNT_TOKEN`
 
-The authentication token is stored in `$env:OP_SERVICE_ACCOUNT_TOKEN` for the current PowerShell session only.
+On a subsequent session after the config file exists, no auth prompt occurs at import - only when the first operation is invoked.
 
 ## Exported Functions
 
 ### Main Operations
-- `Invoke-VMDeployment` - Deploy a new VM with all automation
-- `Remove-VMDeployment` - Remove VM and clean up all resources
+| Function | Description |
+|----------|-------------|
+| `Invoke-VMDeployment` | Deploy a new VM with full automation |
+| `Remove-VMDeployment` | Remove a VM and clean up all resources |
 
 ### DNS Management
-- `Add-DnsRecordToPiHole` - Add an A record to Pi-hole
-- `Remove-DnsRecordFromPiHole` - Remove an A record from Pi-hole
+| Function | Description |
+|----------|-------------|
+| `Add-DnsRecordToPiHole` | Add an A record to Pi-hole |
+| `Remove-DnsRecordFromPiHole` | Remove an A record from Pi-hole |
 
-### SSH Key Management  
-- `New-1PSSHKeyForHost` - Generate SSH key in 1Password
-- `Add-SshConfigEntryLocal` - Add SSH config entry locally
-- `Update-RemoteGladosSsh` - Mirror SSH config to remote host
+### SSH
+| Function | Description |
+|----------|-------------|
+| `New-1PSSHKeyForHost` | Generate or reuse an ed25519 SSH key in 1Password |
+| `Add-SshConfigEntryLocal` | Add a Host block to one or more SSH config files |
+| `Update-RemoteGladosSsh` | Mirror SSH public key and config to a remote share |
+
+### vCenter
+| Function | Description |
+|----------|-------------|
+| `Connect-ToVCenter` | Connect using credentials from 1Password |
+| `Test-VMDeploymentPrerequisites` | Validate template, folder, and cluster exist |
+| `Test-VMHostReadiness` | Verify cluster has connected, non-maintenance hosts |
+| `Install-VirtualMachine` | Lower-level VM clone and configure function |
 
 ### 1Password
-- `Initialize-OpAuth` - Manually trigger 1Password authentication
-- `Clear-OpAuth` - Clear authentication token from session
-- `Save-SudoPasswordTo1Password` - Store sudo password in 1Password
+| Function | Description |
+|----------|-------------|
+| `Initialize-OpAuth` | Ensure service account token is active |
+| `Clear-OpAuth` | Remove token from session |
+| `Save-SudoPasswordTo1Password` | Store or update a VM's sudo password |
 
 ### Utilities
-- `Connect-ToVCenter` - Connect to vCenter with 1Password credentials
-- `Test-VMHostReadiness` - Verify cluster has available hosts
-- `Test-1PasswordSSHAgent` - Check if 1Password SSH agent is running
-- `Install-VirtualMachine` - Lower-level VM creation function
+| Function | Description |
+|----------|-------------|
+| `Find-SiblingRepo` | Locate a sibling GitHub repo by owner matching |
+| `Test-1PasswordSSHAgent` | Verify 1Password SSH agent pipe is present |
 
 ## Logging
 
-All operations are logged to `.\logs\{VMName}.log` with timestamps. Each log file contains:
-- Deployment start/completion timestamps
-- DNS operations
-- SSH key generation and configuration
-- vCenter operations (VM creation, resource modifications)
-- Cleanup operations
+All operations log to `.\logs\{VMName}.log`. The file is created automatically and appended on each run. Key milestones also print to the console.
 
-Example log output:
 ```
-[2025-10-12 03:05:09] Invoke-VMDeployment START Template=ubuntu-template,IP=10.0.0.100,Folder=Linux VMs,PowerOn=True
-[2025-10-12 03:05:09] Checking DNS for deploytest.yourdomain.local
-[2025-10-12 03:05:14] Mirrored SSH pub + config to remote host
-[2025-10-12 03:05:15] Added Pi-hole A record for deploytest.yourdomain.local -> 10.0.0.100
-[2025-10-12 03:05:15] Install-VirtualMachine START
-[2025-10-12 03:05:17] Created sudo credential in 1Password 'deploytest'
-[2025-10-12 03:05:39] New-VM succeeded
-[2025-10-12 03:05:48] Set CPU cores to 1
-[2025-10-12 03:05:49] Set memory to 1GB
-[2025-10-12 03:05:50] VM powered on
-[2025-10-12 03:05:50] Install-VirtualMachine COMPLETE
-[2025-10-12 03:05:50] Invoke-VMDeployment COMPLETE
+[2026-04-05 21:52:15] Invoke-VMDeployment START Template=Ubuntu-Template,IP=192.168.152.3,Folder=Linux VMs,PowerOn=True
+[2026-04-05 21:52:15] Validating vCenter prerequisites (template, folder, cluster)...
+[2026-04-05 21:52:15] Loading VMware PowerCLI module...
+[2026-04-05 21:52:15] Already connected to vCenter vcenter.vollminlab.com.
+[2026-04-05 21:52:15] Checking template 'Ubuntu-Template'...
+[2026-04-05 21:52:15] vCenter prerequisites validated.
+[2026-04-05 21:52:40] New-VM succeeded
+[2026-04-05 21:52:56] VM powered on
+[2026-04-05 21:52:57] Invoke-VMDeployment COMPLETE
 ```
-
-## How It Works
-
-### SSH Key Management with 1Password
-
-1. SSH keys are generated directly in 1Password using `op item create --category "SSH Key" --ssh-generate-key ed25519`
-2. The private key never touches disk - it stays securely in 1Password
-3. The public key is saved locally to `~/.ssh/{hostname}_id_ed25519.pub`
-4. SSH config entries point to the public key; the 1Password SSH agent provides the private key via Windows IPC
-5. The agent automatically handles authentication when you SSH to the host
-
-### Cloud-init Configuration
-
-The module generates cloud-init `user-data` and `metadata` that:
-- Sets the hostname and FQDN
-- Creates a `vollmin` user with sudo privileges
-- Configures the SSH public key for authentication
-- Sets a random sudo password (retrievable from 1Password)
-- Configures static IP networking
-
-### vCenter Integration
-
-- Automatically connects to vCenter using credentials from 1Password
-- Handles self-signed certificates (configurable)
-- Selects the best ESXi host based on available resources
-- Injects cloud-init data via VMware guestinfo properties
-
-## Security Features
-
-- **No credentials in code**: All secrets retrieved from 1Password
-- **Service account tokens**: Process-scoped only, never written to disk
-- **SSH private keys**: Never stored locally, only in 1Password
-- **Secure password handling**: SecureString conversion with proper memory cleanup
-- **Optional token clearing**: Use `-ClearOpAuthToken` for compliance
-- **Confirmation prompts**: Destructive operations require confirmation (High impact)
 
 ## Troubleshooting
 
-### 1Password Authentication Issues
+### Config file missing on a new machine
+Import the module - it will prompt for 1Password authentication and write the config automatically.
+If `op` is not installed, copy `VMDeployTools.config.example.psd1` to `VMDeployTools.config.psd1` and fill in manually.
 
-If you get repeated authentication prompts:
+### homelab-infrastructure repo not found
+```
+WARNING: homelab-infrastructure repo not found as a sibling of this repo. SSH config will not be synced to the infrastructure repo.
+```
+Clone `homelab-infrastructure` into the same parent directory as `VMDeployTools`. Both must have the same GitHub owner in their remote URL.
+
+### Template / folder not found
+The module validates these before creating any resources and lists available options in the error:
+```
+Template 'Ubuntu-24.04-Template' not found in vCenter. Available templates: Ubuntu-22.04-Template, Windows-2022-Template
+```
+
+### Duplicate SSH keys in 1Password
+If two items share the same name (e.g. from a failed retry), the module warns and uses the most recently updated one. Clean up duplicates manually:
 ```powershell
-# Clear the token and re-authenticate
+op item list --vault Homelab --categories "SSH Key" --format json | ConvertFrom-Json |
+    Where-Object title -eq "hostname_id_ed25519"
+# Then: op item delete <id> --vault Homelab
+```
+
+### Pi-hole DNS not updating
+Verify the Pi-hole API is reachable at the configured VIP:
+```powershell
+Invoke-RestMethod -Uri "http://192.168.100.4:5001/" -Method Get
+```
+If unreachable, check that the keepalived VIP is active on one of the Pi-hole nodes.
+
+### 1Password auth issues
+```powershell
 Clear-OpAuth
 Initialize-OpAuth
 ```
 
-### SSH Agent Not Working
-
-Verify the 1Password SSH agent is running:
+### SSH agent not working
 ```powershell
 Test-1PasswordSSHAgent
 ```
 
-Expected output:
-```
-1Password SSH agent is available at \\.\pipe\openssh-ssh-agent
-```
-
-### DNS Record Already Exists
-
-The module checks for existing DNS records before deployment. If a record exists, the deployment will abort with an error. Remove the old record first:
-```powershell
-Remove-DnsRecordFromPiHole -Fqdn "hostname.yourdomain.local"
-```
-
-### VM Already Exists
-
-If a VM with the same name exists, deployment will abort. Remove the old VM first:
-```powershell
-Remove-VMDeployment -VMName "hostname"
-```
-
-## Examples
-
-### Deploy Multiple VMs
-
-```powershell
-Import-Module .\VMDeployTools.psd1
-
-# Deploy web servers
-1..3 | ForEach-Object {
-    Invoke-VMDeployment -VMName "web0$_" `
-                        -TemplateName "ubuntu-template" `
-                        -IPAddress "10.0.0.10$_" `
-                        -VMFolder "WebServers" `
-                        -CPU 2 -MemoryGB 4 -DiskGB 30 -PowerOn
-}
-```
-
-### Deploy with Confirmation
-
-```powershell
-# This will prompt for confirmation (ConfirmImpact='Medium')
-Invoke-VMDeployment "prodvm" -TemplateName "ubuntu-template" `
-    -IPAddress "10.0.0.100" -VMFolder "Production" `
-    -CPU 8 -MemoryGB 16 -DiskGB 100 -PowerOn -Confirm
-```
-
-### Clean Removal with Token Clearing
-
-```powershell
-Remove-VMDeployment "webserver01" -ClearOpAuthToken -Verbose
-```
-
 ## License
 
-MIT License - See LICENSE file for details
-
-## Author
-
-Scott Vollmin - VollminLab
-
-## Contributing
-
-This is a personal homelab project, but suggestions and improvements are welcome via issues or pull requests.
-
----
-
-**Note**: This module is designed for homelab use and includes configurations specific to the VollminLab environment. Modify the script settings to match your infrastructure before use.
+MIT - see LICENSE file.
