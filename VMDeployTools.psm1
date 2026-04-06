@@ -56,6 +56,7 @@ $Script:VCenterServer           = $Script:Config.VCenterServer
 $Script:PiHoleServer            = $Script:Config.PiHoleServer
 $Script:PiHolePort              = $Script:Config.PiHolePort
 $Script:PreferredDatastores     = $Script:Config.PreferredDatastores  # Shared storage preferred over local
+$Script:SshConfigRepoPath       = $Script:Config.SshConfigRepoPath
 
 # ---------- 1Password Authentication State ----------
 # Memoization flag to avoid repeated authentication checks
@@ -714,45 +715,110 @@ function New-1PSSHKeyForHost {
 function Add-SshConfigEntryLocal {
   <#
   .SYNOPSIS
-      Adds an SSH config entry to the local ~/.ssh/config file.
-  
+      Adds an SSH config entry to one or more SSH config files.
+
   .DESCRIPTION
-      Creates a Host block in the local SSH config file with the specified hostname, 
-      DNS name, and identity file path. Skips if entry already exists.
-  
+      Creates a Host block in each specified config file with the given hostname,
+      DNS name, and identity file path. Skips any file that already contains the
+      Host block (idempotent). Defaults to ~/.ssh/config when no paths are given.
+
   .PARAMETER HostName
       The SSH host alias to use.
-  
+
   .PARAMETER DnsName
       The fully qualified domain name or IP address.
-  
+
   .PARAMETER PublicKeyPath
       Path to the public key file (for 1Password SSH agent).
-  
+
+  .PARAMETER ConfigPaths
+      Optional. One or more SSH config file paths to write to.
+      Defaults to ~/.ssh/config.
+
   .EXAMPLE
       Add-SshConfigEntryLocal -HostName "web01" -DnsName "web01.vollminlab.com" -PublicKeyPath "~/.ssh/web01_id_ed25519.pub"
   #>
   [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Low')]
   param([Parameter(Mandatory)][string]$HostName,
         [Parameter(Mandatory)][string]$DnsName,
-        [Parameter(Mandatory)][string]$PublicKeyPath)
+        [Parameter(Mandatory)][string]$PublicKeyPath,
+        [string[]]$ConfigPaths)
 
   if (-not $PSCmdlet.ShouldProcess($HostName, "Add SSH config entry")) {
     return
   }
 
-  $conf = Join-Path $HOME '.ssh\config'
-  if (-not (Test-Path $conf)) { New-Item -ItemType File -Path $conf -Force | Out-Null }
+  if (-not $ConfigPaths -or $ConfigPaths.Count -eq 0) {
+    $ConfigPaths = @(Join-Path $HOME '.ssh\config')
+  }
 
-  if (-not (Select-String -Path $conf -Pattern "^Host\s+$([regex]::Escape($HostName))\$" -Quiet)) {
-    $entry = @"
+  $entry = @"
 Host $HostName
   HostName $DnsName
   User vollmin
   IdentitiesOnly yes
   IdentityFile $PublicKeyPath
 "@
-    Add-Content -Path $conf -Value $entry
+
+  foreach ($conf in $ConfigPaths) {
+    if (-not (Test-Path $conf)) { New-Item -ItemType File -Path $conf -Force | Out-Null }
+    if (-not (Select-String -Path $conf -Pattern "^Host\s+$([regex]::Escape($HostName))\$" -Quiet)) {
+      Add-Content -Path $conf -Value $entry
+    }
+  }
+}
+
+function Invoke-SshConfigRepoCommit {
+  <#
+  .SYNOPSIS
+      Commits and pushes a change to the SSH config file in the infrastructure repo.
+
+  .DESCRIPTION
+      Stages the SSH config file, commits with a descriptive message, and pushes.
+      Failures warn but never throw — a git issue should never abort a deployment.
+
+  .PARAMETER VMName
+      Used for the commit message and log entries.
+
+  .PARAMETER Action
+      'add' or 'remove' — used in the commit message.
+  #>
+  param(
+    [Parameter(Mandatory)][string]$VMName,
+    [Parameter(Mandatory)][ValidateSet('add','remove')][string]$Action
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Script:SshConfigRepoPath)) { return }
+  if (-not (Test-Path $Script:SshConfigRepoPath)) {
+    Write-LogEntry -VMName $VMName -Message "WARN: SshConfigRepoPath not found, skipping repo commit: $Script:SshConfigRepoPath" -AlwaysShow
+    return
+  }
+
+  $repoRoot = & git -C (Split-Path $Script:SshConfigRepoPath) rev-parse --show-toplevel 2>$null
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
+    Write-Warning "SSH config repo not found at '$Script:SshConfigRepoPath' — skipping commit"
+    return
+  }
+
+  $verb = if ($Action -eq 'add') { 'Add' } else { 'Remove' }
+  $commitMsg = "$verb SSH config entry for $VMName"
+
+  try {
+    & git -C $repoRoot add (Resolve-Path $Script:SshConfigRepoPath) 2>&1 | Out-Null
+    $status = & git -C $repoRoot status --porcelain (Resolve-Path $Script:SshConfigRepoPath) 2>$null
+    if ([string]::IsNullOrWhiteSpace($status)) {
+      Write-LogEntry -VMName $VMName -Message "SSH config repo: no changes to commit (entry already present)"
+      return
+    }
+    & git -C $repoRoot commit -m $commitMsg 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
+    & git -C $repoRoot push 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "git push failed" }
+    Write-LogEntry -VMName $VMName -Message "SSH config repo: committed and pushed — '$commitMsg'" -AlwaysShow
+  } catch {
+    $msg = "WARN: Failed to commit/push SSH config repo change: $_"
+    Write-LogEntry -VMName $VMName -Message $msg -AlwaysShow
+    Write-Warning $msg
   }
 }
 
@@ -1332,8 +1398,14 @@ function Invoke-VMDeployment {
 
   # Create SSH key in 1Password (ed25519), save pub locally, no private key on disk
   $key = New-1PSSHKeyForHost -HostName $VMName
-  # Local config entry
-  Add-SshConfigEntryLocal -HostName $VMName -DnsName $fqdn -PublicKeyPath $key.PublicKeyPathLocal
+
+  # Build list of SSH config files to update — always ~/.ssh/config, plus the repo copy if configured
+  $sshConfigPaths = @(Join-Path $HOME '.ssh\config')
+  if (-not [string]::IsNullOrWhiteSpace($Script:SshConfigRepoPath)) {
+    $sshConfigPaths += $Script:SshConfigRepoPath
+  }
+  Add-SshConfigEntryLocal -HostName $VMName -DnsName $fqdn -PublicKeyPath $key.PublicKeyPathLocal -ConfigPaths $sshConfigPaths
+  Invoke-SshConfigRepoCommit -VMName $VMName -Action 'add'
 
   # If we're NOT on GLaDOS, try to copy pub + append host block remotely too
   if (-not $Script:IsGlados) {
@@ -1427,6 +1499,11 @@ function Remove-VMDeployment {
   if (Test-Path $localConfig) {
     Remove-HostBlockFromConfig -HostName $VMName -ConfigPath $localConfig
     Write-LogEntry -VMName $VMName -Message "Removed local SSH config entry for $VMName"
+  }
+  if (-not [string]::IsNullOrWhiteSpace($Script:SshConfigRepoPath) -and (Test-Path $Script:SshConfigRepoPath)) {
+    Remove-HostBlockFromConfig -HostName $VMName -ConfigPath $Script:SshConfigRepoPath
+    Write-LogEntry -VMName $VMName -Message "Removed SSH config entry from repo copy"
+    Invoke-SshConfigRepoCommit -VMName $VMName -Action 'remove'
   }
   
   # Remove from local known_hosts (hostname and FQDN)
