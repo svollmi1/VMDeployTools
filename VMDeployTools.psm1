@@ -405,36 +405,57 @@ function Connect-ToVCenter {
   <#
   .SYNOPSIS
       Establishes a connection to vCenter if not already connected.
-  
+
   .DESCRIPTION
       Checks for an existing vCenter connection and establishes a new one if needed.
-      Retrieves credentials from 1Password automatically. Automatically installs VMware.PowerCLI 
+      Retrieves credentials from 1Password automatically. Automatically installs VMware.PowerCLI
       module if not present.
-  
+
+  .PARAMETER VMName
+      Optional. When provided, progress messages are written to the VM log via Write-LogEntry.
+      When omitted, progress messages are written to the verbose stream only.
+
   .EXAMPLE
-      Connect-ToVCenter
+      Connect-ToVCenter -VMName "web01"
   #>
-  if (-not (Get-Module VMware.PowerCLI -ListAvailable)) { Install-Module -Name VMware.PowerCLI -Scope CurrentUser -Force }
+  param([string]$VMName)
+
+  # Helper: log to VM log file with AlwaysShow when VMName is known; else Write-Verbose
+  $log = {
+    param([string]$msg)
+    if ($VMName) { Write-LogEntry -VMName $VMName -Message $msg -AlwaysShow }
+    else         { Write-Verbose $msg }
+  }
+
+  if (-not (Get-Module VMware.PowerCLI -ListAvailable)) {
+    & $log "VMware.PowerCLI module not found. Installing from PSGallery (this may take a moment)..."
+    Install-Module -Name VMware.PowerCLI -Scope CurrentUser -Force
+  }
+
+  & $log "Loading VMware PowerCLI module..."
   Import-Module VMware.PowerCLI -ErrorAction Stop
-  
+
   # Configure PowerCLI to ignore invalid certificates (for self-signed certs)
   Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
-  
+
   if (-not ($global:DefaultVIServer) -or $global:DefaultVIServer.IsConnected -ne $true) {
-    # Get credentials from 1Password
+    & $log "Connecting to vCenter $Script:VCenterServer..."
     Initialize-OpAuth
     $username = op item get $Script:VCenterCredItemTitle --vault $Script:VaultName --field username --format human-readable
     $password = op item get $Script:VCenterCredItemTitle --vault $Script:VaultName --field password --format human-readable --reveal
-    
+
     if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($password)) {
       throw "Failed to retrieve vCenter credentials from 1Password item '$Script:VCenterCredItemTitle'"
     }
-    
+
     $securePassword = ConvertTo-SecureString $password.Trim() -AsPlainText -Force
     $cred = New-Object System.Management.Automation.PSCredential($username.Trim(), $securePassword)
-    
+
     $conn = Connect-VIServer -Server $Script:VCenterServer -Credential $cred
     if (-not $conn.IsConnected) { throw "Failed to connect to vCenter." }
+    & $log "Connected to vCenter $Script:VCenterServer."
+  } else {
+    & $log "Already connected to vCenter $Script:VCenterServer."
   }
 }
 
@@ -462,14 +483,14 @@ function Test-VMHostReadiness {
   try {
     $cluster  = Get-Cluster -Name $ClusterName -ErrorAction Stop
     $allHosts = Get-VMHost -Location $cluster
-    $hosts    = $allHosts | Where-Object { $_.ConnectionState -eq "Connected" -and $_.State -ne "Maintenance" }
-    $excluded = $allHosts | Where-Object { $_.ConnectionState -ne "Connected" -or $_.State -eq "Maintenance" }
-    foreach ($h in $excluded) { Write-LogEntry -VMName $VMName -Message ("Excluded host '{0}': State={1}, ConnectionState={2}" -f $h.Name,$h.State,$h.ConnectionState) }
+    $hosts    = $allHosts | Where-Object { $_.ConnectionState -eq "Connected" }
+    $excluded = $allHosts | Where-Object { $_.ConnectionState -ne "Connected" }
+    foreach ($h in $excluded) { Write-LogEntry -VMName $VMName -Message ("Excluded host '{0}': ConnectionState={1}" -f $h.Name,$h.ConnectionState) }
     if ($hosts.Count -eq 0) { throw "No suitable hosts found in cluster '$ClusterName'." }
     foreach ($vmHost in $hosts) {
       $cpuAvail = $vmHost.CpuTotalMhz - $vmHost.CpuUsageMhz
       $memAvail = $vmHost.MemoryTotalGB - $vmHost.MemoryUsageGB
-      Write-LogEntry -VMName $VMName -Message ("Host '{0}': CPU {1}/{2}MHz free, Mem {3}GB free, State={4}, Conn={5}" -f $vmHost.Name,$cpuAvail,$vmHost.CpuTotalMhz,[math]::Round($memAvail,2),$vmHost.State,$vmHost.ConnectionState)
+      Write-LogEntry -VMName $VMName -Message ("Host '{0}': CPU {1}/{2}MHz free, Mem {3}GB free, Conn={4}" -f $vmHost.Name,$cpuAvail,$vmHost.CpuTotalMhz,[math]::Round($memAvail,2),$vmHost.ConnectionState)
     }
     Write-LogEntry -VMName $VMName -Message ("Found {0} suitable hosts in cluster '{1}'" -f $hosts.Count, $ClusterName)
     return $true
@@ -477,6 +498,78 @@ function Test-VMHostReadiness {
     Write-LogEntry -VMName $VMName -Message ("Host readiness check FAILED: {0}" -f $_)
     throw
   }
+}
+
+function Test-VMDeploymentPrerequisites {
+  <#
+  .SYNOPSIS
+      Validates vCenter prerequisites before committing any side effects during deployment.
+
+  .DESCRIPTION
+      Connects to vCenter and verifies that the specified template, folder, and cluster
+      all exist and are accessible. Designed to be called early in Invoke-VMDeployment,
+      before SSH key creation, DNS changes, or any other irreversible operations.
+      On failure, throws a clear, actionable error message including available alternatives.
+
+  .PARAMETER VMName
+      The VM name, used for log file routing.
+
+  .PARAMETER TemplateName
+      The vCenter template name to validate.
+
+  .PARAMETER VMFolder
+      The vCenter folder name to validate.
+
+  .EXAMPLE
+      Test-VMDeploymentPrerequisites -VMName "web01" -TemplateName "Ubuntu-24.04-Template" -VMFolder "Lab"
+  #>
+  param(
+    [Parameter(Mandatory)][string]$VMName,
+    [Parameter(Mandatory)][string]$TemplateName,
+    [Parameter(Mandatory)][string]$VMFolder
+  )
+
+  Write-LogEntry -VMName $VMName -Message "Validating vCenter prerequisites (template, folder, cluster)..." -AlwaysShow
+
+  Connect-ToVCenter -VMName $VMName
+
+  # --- Template ---
+  Write-LogEntry -VMName $VMName -Message ("Checking template '{0}'..." -f $TemplateName) -AlwaysShow
+  try {
+    Get-Template -Name $TemplateName -ErrorAction Stop | Out-Null
+  } catch {
+    $available = (Get-Template | Select-Object -ExpandProperty Name) -join ', '
+    if ([string]::IsNullOrWhiteSpace($available)) { $available = '(none found)' }
+    $msg = "Template '{0}' not found in vCenter. Available templates: {1}" -f $TemplateName, $available
+    Write-LogEntry -VMName $VMName -Message $msg -AlwaysShow
+    throw $msg
+  }
+
+  # --- Folder ---
+  Write-LogEntry -VMName $VMName -Message ("Checking folder '{0}'..." -f $VMFolder) -AlwaysShow
+  try {
+    Get-Folder -Name $VMFolder -ErrorAction Stop | Out-Null
+  } catch {
+    $available = (Get-Folder | Where-Object { $_.Type -eq 'VM' } | Select-Object -ExpandProperty Name | Sort-Object) -join ', '
+    if ([string]::IsNullOrWhiteSpace($available)) { $available = '(none found)' }
+    $msg = "VM folder '{0}' not found in vCenter. Available VM folders: {1}" -f $VMFolder, $available
+    Write-LogEntry -VMName $VMName -Message $msg -AlwaysShow
+    throw $msg
+  }
+
+  # --- Cluster ---
+  Write-LogEntry -VMName $VMName -Message ("Checking cluster '{0}'..." -f $Script:ClusterName) -AlwaysShow
+  try {
+    Get-Cluster -Name $Script:ClusterName -ErrorAction Stop | Out-Null
+  } catch {
+    $available = (Get-Cluster | Select-Object -ExpandProperty Name | Sort-Object) -join ', '
+    if ([string]::IsNullOrWhiteSpace($available)) { $available = '(none found)' }
+    $msg = "Cluster '{0}' not found in vCenter. Available clusters: {1}" -f $Script:ClusterName, $available
+    Write-LogEntry -VMName $VMName -Message $msg -AlwaysShow
+    throw $msg
+  }
+
+  Write-LogEntry -VMName $VMName -Message "vCenter prerequisites validated." -AlwaysShow
 }
 
 # ---------- 1Password items ----------
@@ -565,30 +658,52 @@ function New-1PSSHKeyForHost {
   }
 
   Initialize-OpAuth
-  
+
   $title = "${HostName}_id_ed25519"
 
-  # Generate SSH key directly in 1Password using op item create
-  # This is the correct way per 1Password CLI documentation
-  $result = & op item create `
-    --vault $Script:VaultName `
-    --category "SSH Key" `
-    --title $title `
-    --tags "Homelab,AutoProvisioned" `
-    --ssh-generate-key "ed25519" 2>&1
-  
-  if ($LASTEXITCODE -ne 0) {
-    throw "Failed to create SSH Key item in 1Password. Error: $result"
+  # Use item list to find by title — avoids ambiguity errors when duplicates exist
+  $itemListJson = & op item list --vault $Script:VaultName --categories "SSH Key" --format json 2>$null
+  $itemId = $null
+  if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($itemListJson)) {
+    $foundItems = ($itemListJson | ConvertFrom-Json) | Where-Object { $_.title -eq $title }
+    if ($foundItems.Count -gt 1) {
+      # Duplicates present — warn and use the most recently updated one
+      Write-LogEntry -VMName $HostName -Message ("WARNING: {0} duplicate SSH key items named '{1}' found in 1Password. Using the most recent. Consider deleting duplicates." -f $foundItems.Count, $title) -AlwaysShow
+      $itemId = ($foundItems | Sort-Object { $_.updated_at } -Descending | Select-Object -First 1).id
+    } elseif ($foundItems.Count -eq 1) {
+      $itemId = $foundItems[0].id
+    }
   }
 
-  # Get the public key from the newly created item
-  $pub = & op item get $title `
+  if ($itemId) {
+    Write-LogEntry -VMName $HostName -Message "SSH key '$title' already exists in 1Password — reusing it" -AlwaysShow
+  } else {
+    # Generate SSH key directly in 1Password using op item create
+    $result = & op item create `
+      --vault $Script:VaultName `
+      --category "SSH Key" `
+      --title $title `
+      --tags "Homelab,AutoProvisioned" `
+      --ssh-generate-key "ed25519" 2>&1
+
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed to create SSH Key item in 1Password. Error: $result"
+    }
+
+    # Get the ID of the newly created item
+    $newItem = & op item list --vault $Script:VaultName --categories "SSH Key" --format json 2>$null | ConvertFrom-Json
+    $itemId = ($newItem | Where-Object { $_.title -eq $title } | Sort-Object { $_.updated_at } -Descending | Select-Object -First 1).id
+    if (-not $itemId) { throw "Failed to locate newly created SSH Key item '$title' in 1Password" }
+  }
+
+  # Get the public key using the unambiguous item ID
+  $pub = & op item get $itemId `
     --vault $Script:VaultName `
     --field "public key" `
     --format human-readable
-  
+
   if ([string]::IsNullOrWhiteSpace($pub)) {
-    throw "Failed to retrieve public key from newly created SSH Key item"
+    throw "Failed to retrieve public key from SSH Key item '$title' (id: $itemId)"
   }
 
   # Write PUBLIC key locally to ~/.ssh
@@ -832,27 +947,8 @@ function Get-NetworkPortGroupFromIP {
   
   Write-Verbose "Determining port group for IP $IPAddress (subnet $subnet, number $subnetNumber)"
   
-  # Get all port groups and find one that matches our subnet pattern
-  # Try distributed port groups first, then fall back to standard if needed
-  $allPortGroups = @()
-  try {
-    # Import VDS module if available for distributed port groups
-    if (Get-Module -ListAvailable -Name VMware.VimAutomation.Vds) {
-      Import-Module VMware.VimAutomation.Vds -ErrorAction SilentlyContinue
-      $allPortGroups = Get-VDPortgroup | Where-Object { $_.Name -match '^\d{3}-DPG-' }
-      Write-Verbose "Found $($allPortGroups.Count) distributed port groups matching pattern"
-    }
-  } catch {
-    Write-Verbose "VDS module not available, falling back to standard port groups"
-  }
-  
-  # Fallback to standard port groups if no distributed ones found
-  if ($allPortGroups.Count -eq 0) {
-    $allPortGroups = Get-VirtualPortGroup | Where-Object { $_.Name -match '^\d{3}-DPG-' }
-    Write-Verbose "Found $($allPortGroups.Count) standard port groups matching pattern"
-  }
-  
-  Write-Verbose "Found $($allPortGroups.Count) port groups matching pattern: $($allPortGroups.Name -join ', ')"
+  $allPortGroups = Get-VDPortgroup | Where-Object { $_.Name -match '^\d{3}-DPG-' }
+  Write-Verbose "Found $($allPortGroups.Count) distributed port groups matching pattern: $($allPortGroups.Name -join ', ')"
   
   # Look for a port group that starts with the subnet number
   $matchingPG = $allPortGroups | Where-Object { $_.Name -match "^$subnetNumber-DPG-" } | Select-Object -First 1
@@ -1042,7 +1138,7 @@ runcmd:
     if ($sharedDs) {
       # Shared storage available - can use any host
       $preferredDs = $sharedDs
-      $availableHosts = Get-VMHost -Location $clusterObj | Where-Object { $_.ConnectionState -eq "Connected" -and $_.State -ne "Maintenance" }
+      $availableHosts = Get-VMHost -Location $clusterObj | Where-Object { $_.ConnectionState -eq "Connected" }
       if ($availableHosts.Count -eq 0) { throw "No available hosts found for VM deployment." }
       $targetHost = $availableHosts | Sort-Object -Property CpuUsageMhz | Select-Object -First 1
       Write-LogEntry -VMName $VMName -Message ("Selected shared datastore '{0}' ({1}GB free, {2}GB required)" -f $preferredDs.Name, [math]::Round($preferredDs.FreeSpaceGB, 2), [math]::Round($requiredGB, 2))
@@ -1051,7 +1147,7 @@ runcmd:
       # Shared storage full/unavailable - need to pick host with local datastore that has space
       Write-LogEntry -VMName $VMName -Message "Shared storage unavailable, checking local datastores..."
       
-      $availableHosts = Get-VMHost -Location $clusterObj | Where-Object { $_.ConnectionState -eq "Connected" -and $_.State -ne "Maintenance" }
+      $availableHosts = Get-VMHost -Location $clusterObj | Where-Object { $_.ConnectionState -eq "Connected" }
       if ($availableHosts.Count -eq 0) { throw "No available hosts found for VM deployment." }
       
       $hostWithSpace = $null
@@ -1098,7 +1194,7 @@ runcmd:
   # 6) Configure network adapter to correct port group based on IP
   try {
     $portGroupName = Get-NetworkPortGroupFromIP -IPAddress $IPAddress
-    $network = Get-VirtualPortGroup -Name $portGroupName
+    $network = Get-VDPortgroup -Name $portGroupName
     $vmNetworkAdapter = Get-NetworkAdapter -VM $newVm
     Set-NetworkAdapter -NetworkAdapter $vmNetworkAdapter -Portgroup $network -Confirm:$false | Out-Null
     Write-LogEntry -VMName $VMName -Message "Set network adapter to port group '$portGroupName'"
@@ -1226,6 +1322,7 @@ function Invoke-VMDeployment {
 
   # WhatIf mode - just describe what would happen (for explicit -WhatIf parameter)
   if ($WhatIfPreference) {
+    Write-Host "[WhatIf] Would validate template '$TemplateName', folder '$VMFolder', cluster '$Script:ClusterName' in vCenter"
     Write-Host "[WhatIf] Would generate ed25519 SSH keypair for $VMName"
     Write-Host "[WhatIf] Would store SSH key in 1Password vault '$($Script:VaultName)' as '${VMName}_id_ed25519'"
     Write-Host "[WhatIf] Would save public key to ~/.ssh/${VMName}_id_ed25519.pub"
@@ -1233,11 +1330,15 @@ function Invoke-VMDeployment {
     if (-not $Script:IsGlados) {
       Write-Host "[WhatIf] Would mirror SSH config to remote GLaDOS host"
     }
-    Write-Host "[WhatIf] Would connect to vCenter using credentials from 1Password"
     Write-Host "[WhatIf] Would add DNS record to Pi-hole"
     Write-Host "[WhatIf] Would create VM from template '$TemplateName'"
     return
   }
+
+  # Validate vCenter prerequisites BEFORE any side effects.
+  # Connects to vCenter and confirms template/folder/cluster exist.
+  # If any check fails we abort here — nothing has been created yet.
+  Test-VMDeploymentPrerequisites -VMName $VMName -TemplateName $TemplateName -VMFolder $VMFolder
 
   # Create SSH key in 1Password (ed25519), save pub locally, no private key on disk
   $key = New-1PSSHKeyForHost -HostName $VMName
@@ -1253,10 +1354,9 @@ function Invoke-VMDeployment {
     else     { Write-LogEntry -VMName $VMName -Message "Skipped/failed mirroring to GLaDOS (share inaccessible)" }
   }
 
-  Connect-ToVCenter | Out-Null
   Add-DnsRecordToPiHole -Fqdn $fqdn -IPAddress $IPAddress
 
-  # Reference variable to receive the generated sudo password from Install-VirtualMachine
+  # Deploy the VM (Connect-ToVCenter is a no-op — already connected by Test-VMDeploymentPrerequisites)
   $passwordRef = [ref]""
   Install-VirtualMachine `
     -VMName           $VMName `
@@ -1398,7 +1498,7 @@ function Remove-VMDeployment {
   }
 
   # 5) Remove VM
-  Connect-ToVCenter | Out-Null
+  Connect-ToVCenter -VMName $VMName
   $vmObj = Get-VM -Name $VMName -ErrorAction SilentlyContinue
   if ($vmObj) {
     Stop-VM -VM $vmObj -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
