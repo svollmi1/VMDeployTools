@@ -6,3 +6,6 @@ logs/
 
 # Claude Code local config
 .claude/
+
+# git worktrees used during development
+.worktrees/
